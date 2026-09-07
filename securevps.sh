@@ -4022,11 +4022,14 @@ sv_cmd_scan() {
   return 0
 }
 
-# Undo one run's manifest, newest entry first.
+# Undo one run's manifest, newest entry first. The tally goes in a global
+# rather than on stdout, because the restore messages go there too and a
+# "$(...)" capture would feed them into the arithmetic.
+SV_REVERT_COUNT=0
 sv_revert_run() {
   local dir="$1" filter="$2"
   [[ -f "$dir/manifest.tsv" ]] || { sv_warn "$(basename "$dir") has no manifest"; return 0; }
-  local count=0 action module path stored
+  local action module path stored
   while IFS=$'\t' read -r action module path stored; do
     [[ "$action" == \#* || -z "$action" ]] && continue
     # shellcheck disable=SC2086  # deliberate word splitting
@@ -4036,9 +4039,9 @@ sv_revert_run() {
       continue
     fi
     sv_revert_entry "$action" "$module" "$path" "$stored" "$dir"
-    count=$((count + 1))
+    SV_REVERT_COUNT=$((SV_REVERT_COUNT + 1))
   done <<< "$(tac "$dir/manifest.tsv")"
-  printf '%s' "$count"
+  return 0
 }
 
 sv_cmd_revert() {
@@ -4065,14 +4068,14 @@ sv_cmd_revert() {
   fi
 
   sv_say "Reverting ${#runs[@]} run(s)${filter:+, modules: $filter}"
-  local total=0 dir
+  local dir
   for dir in "${runs[@]}"; do
     sv_debug "run $(basename "$dir")"
-    total=$((total + $(sv_revert_run "$dir" "$filter")))
+    sv_revert_run "$dir" "$filter"
   done
 
   sv_say ""
-  sv_ok "$total file(s) restored"
+  sv_ok "$SV_REVERT_COUNT file(s) restored"
   sv_note "Services still have the new config loaded. Restart the ones you care about, or reboot."
   local n
   for n in "${SV_NOTES[@]}"; do printf '  %s %s\n' "${C_YELLOW}*${C_RESET}" "$n"; done

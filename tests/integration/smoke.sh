@@ -114,7 +114,11 @@ printf '  second run reported %s change(s)\n' "$changes"
 check "second run is a no-op" "[ '${changes:-99}' -le 2 ]"
 
 step "revert"
-$SV revert >/tmp/revert.log 2>&1
+# Two runs touched login.defs, so this also proves the older run is replayed
+# after the newer one rather than the command dying between them.
+$SV revert >/tmp/revert.log 2>&1 && rc=0 || rc=$?
+check "revert exits 0"            "[ '$rc' = 0 ]"
+check "revert reports a count"    "grep -qE '[0-9]+ file\(s\) restored' /tmp/revert.log"
 check "sshd config still valid after revert" "sshd -t"
 check "our drop-in is gone"       "[ ! -f /etc/ssh/sshd_config.d/99-securevps.conf ]"
 check "login.defs umask restored" "! grep -qE '^UMASK\s+027' /etc/login.defs"

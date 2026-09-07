@@ -12,6 +12,11 @@ Columns:
 Sources of the recommendations: the Dokploy remote server security page, CIS Benchmarks for
 Debian/Ubuntu, Lynis controls, `ssh-audit` hardening guides, and the Docker CIS benchmark.
 
+Dokploy's page is short and checks eight things: UFW installed, active, default-deny inbound,
+and only necessary ports open; SSH enabled with key auth and password auth off; fail2ban
+installed, running, and protecting SSH. Everything it lists is in here. The rest of this
+document is the surrounding work its checks assume you already did.
+
 ---
 
 ## 1. `updates` - patching
@@ -61,6 +66,7 @@ Written to `/etc/ssh/sshd_config.d/99-securevps.conf` so the distro's own config
 | `ClientAliveInterval 300`, `ClientAliveCountMax 2` | on | `--client-alive <s>` | low |
 | Disable `X11Forwarding`, `AllowAgentForwarding`, `AllowTcpForwarding`, `PermitTunnel` | on | `--allow-tcp-forwarding`, `--allow-agent-forwarding` | medium |
 | `PermitEmptyPasswords no`, `PermitUserEnvironment no`, `IgnoreRhosts yes` | on | n/a | low |
+| `UsePAM no` once key-only auth is confirmed working | off | `--disable-pam` | high |
 | Modern crypto only: curve25519 and DH group16+ KEX, chacha20/AES-GCM ciphers, ETM MACs | on | `--legacy-crypto` | medium |
 | Regenerate host keys, drop DSA and small RSA, keep ed25519 + RSA 4096 | on | `--no-regen-hostkeys` | medium |
 | Trim `/etc/ssh/moduli` to >= 3072-bit groups | on | n/a | low |
@@ -70,6 +76,13 @@ Written to `/etc/ssh/sshd_config.d/99-securevps.conf` so the distro's own config
 Forwarding restrictions are the one place I expect pushback. `AllowTcpForwarding no` breaks the
 SSH-tunnel pattern that Dokploy and similar tools use to reach an admin UI bound to localhost.
 The flag is there for exactly that reason.
+
+Dokploy's page recommends `UsePAM no` alongside key-only auth, and I have it behind a flag
+rather than on by default. Turning PAM off does remove a large chunk of authentication code
+from the path, but it also disables `pam_faillock`, account expiry, the login banner, session
+limits, and the TOTP module in section 17. On a single-purpose deploy target that trade is
+defensible. As a default for a general script it is not, and getting it wrong on a box with no
+usable key is unrecoverable without console access.
 
 ## 4. `firewall` - packet filtering
 
@@ -94,7 +107,7 @@ This module matters more than any other on a Dokploy-style box.
 
 | Control | Default | Flag | Risk |
 |---|---|---|---|
-| Fix the UFW bypass by inserting DROP rules in the `DOCKER-USER` chain | on when Docker is present | `--no-docker-firewall-fix` | medium |
+| Fix the UFW bypass with `DOCKER-USER` chain rules, the same approach as `ufw-docker` | on when Docker is present | `--no-docker-firewall-fix` | medium |
 | Allowlist source networks that may reach published container ports | RFC1918 + loopback | `--docker-allow-from <cidr>` | medium |
 | `daemon.json`: `"no-new-privileges": true` | on | `--no-daemon-config` | medium |
 | `daemon.json`: `"icc": false` (no default-bridge container-to-container traffic) | off | `--disable-icc` | high |
@@ -108,7 +121,15 @@ This module matters more than any other on a Dokploy-style box.
 Docker writes its own iptables rules and they are evaluated before UFW's. A container started
 with `-p 5432:5432` is reachable from the internet even with `ufw deny 5432` in place. Anyone
 who thinks their database is firewalled off is very often wrong about this. The fix is a rule
-in `DOCKER-USER`, which Docker leaves alone.
+in `DOCKER-USER`, which Docker leaves alone. Dokploy's docs point at
+[ufw-docker](https://github.com/chaifeng/ufw-docker) for this, and the rules this module writes
+are the same idea. Whether to vendor that project or generate the chain rules directly is an
+open question in the checklist below.
+
+Dokploy also calls the provider's own firewall the reliable answer here, because it filters
+before any packet reaches Docker's iptables rules. I agree, and it is why the provider firewall
+is the first item in the manual section at the end of this document. The `DOCKER-USER` rules
+are the belt; the provider firewall is the braces.
 
 ## 6. `bruteforce` - fail2ban or CrowdSec
 
@@ -118,12 +139,17 @@ in `DOCKER-USER`, which Docker leaves alone.
 | sshd jail, `maxretry 5`, `findtime 10m`, `bantime 1h` | on | `--maxretry`, `--findtime`, `--bantime` | low |
 | `recidive` jail: repeat offenders banned for a week | on | `--no-recidive` | low |
 | Allowlist your current SSH client IP and RFC1918 | on | `--ignore-ip <cidr>`, `--no-auto-ignore-ip` | low |
+| sshd jail `mode` | `normal` | `--aggressive` sets `mode = aggressive` | low |
 | systemd journal backend | on | n/a | low |
 | Ban action matched to the firewall backend | auto | n/a | low |
 | CrowdSec: install the firewall bouncer and the ssh/http collections | when selected | `--crowdsec-collections` | low |
 
 Allowlisting the IP you are connected from is not optional in my view. Fail2ban banning the
 admin during setup is a rite of passage nobody needs.
+
+Dokploy recommends the sshd jail's aggressive mode, which also matches probes that never get as
+far as a failed password. With key-only auth already in place it mostly bans scanners you were
+never at risk from, so it is a flag rather than a default. It costs nothing to turn on.
 
 ## 7. `sysctl` - kernel and network parameters
 

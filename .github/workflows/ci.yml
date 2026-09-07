@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck securevps.sh tests/integration/*.sh
+      - name: the script parses and answers for itself
+        run: |
+          bash -n securevps.sh
+          ./securevps.sh --version
+          ./securevps.sh help > /dev/null
+      - name: unknown options are refused
+        run: |
+          ! ./securevps.sh --no-such-flag 2>/dev/null
+          ! ./securevps.sh --only nosuchmodule harden 2>/dev/null
+
+  integration:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [noble, jammy, bookworm]
+    steps:
+      - uses: actions/checkout@v4
+      - name: install debootstrap
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq debootstrap
+      - name: run the suite in a throwaway rootfs
+        run: sudo tests/integration/run.sh ${{ matrix.suite }}

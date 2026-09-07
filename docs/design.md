@@ -29,8 +29,7 @@ securevps.sh docker --disable-icc
 |---|---|
 | `--dry-run` | print every change as a diff, touch nothing |
 | `--yes` | no prompts, for cloud-init and CI |
-| `--profile minimal\|standard\|paranoid` | which modules `harden` runs and how far each goes |
-| `--config /etc/securevps.conf` | key=value file, flags on the command line win |
+| `--profile minimal\|standard` | which steps `harden` runs |
 | `--only <a,b>` / `--skip <a,b>` | module selection for `harden` |
 | `--no-backup` | skip config backups, off by default |
 | `--json` | machine-readable output, mainly for `scan` |
@@ -40,15 +39,20 @@ Every module also takes `--dry-run` and `--revert` on its own.
 
 ## Profiles
 
-`minimal` is the set I would run on any box without thinking: updates, ssh, firewall,
-bruteforce, sysctl, time, banner. Nothing in it can break an application.
+`minimal` is the set I would run on any box without thinking: updates, ssh,
+firewall, bruteforce, sysctl, time, banner. Nothing in it can break an
+application.
 
-`standard` is the default. It adds user, docker when Docker is present, pam, services,
-logging, kmodules, apparmor.
+`standard` is the default. It adds user, docker when Docker is present, pam,
+services, logging, kmodules, apparmor, banner and mount options.
 
-`paranoid` adds mounts with `noexec`, integrity, the CIS audit ruleset, stricter sysctl, and
-turns on the controls the other profiles leave off. It will break something. That is the point
-of a separate name.
+There is no third profile. An earlier draft had `paranoid`, and most of what it
+turned on was either actively harmful on a container host (noexec `/tmp`, no
+container-to-container traffic), noisy enough to fill a small disk (the CIS
+audit ruleset), or meaningless on a VPS (blacklisting usb-storage). The parts
+worth keeping went into the defaults instead: mount hardening on `/dev/shm`,
+and aggressive fail2ban matching. Everything else it did is still one flag
+away, which is the better place for a setting that breaks things.
 
 ## Behaviour rules
 
@@ -78,12 +82,10 @@ in the `docker` group, if the box is a router, the script reports and does not s
 
 ```
 securevps.sh              # the whole thing, one file
-securevps.conf.example    # the settings people actually change
-docs/
-  guide.md                # the prose guide
-  hardening-catalog.md    # every control, its default, its flag
-  design.md               # this file
+README.md                 # the guide, and one section per hardening practice
+docs/design.md            # this file
 tests/
+  readme-commands.sh      # every command in the README must parse
   integration/run.sh      # builds a throwaway rootfs and runs the suite in it
   integration/smoke.sh    # the suite itself
 ```
@@ -94,17 +96,19 @@ and the thing you download is the thing you read. For a script whose job is to
 edit sshd on a machine you cannot afford to lose, being auditable in one pass
 is worth more than being tidy to work on.
 
-Section banners divide it, and every module follows the same three-function
-contract, so the size is navigable:
+The file reads top to bottom in three parts: the helpers every step is built
+from, the settings table, then the steps themselves. Each step is two
+functions, with a block above them saying what it changes and why:
 
 ```
 <m>_apply    make the changes
-<m>_scan     report on them via sv_check
-<m>_desc     one line for the help output
+<m>_scan     report on them, one sv_check per finding
 ```
 
-Adding a module means writing those three, adding its options with `defopt`,
-and adding its name to `SV_MODULE_ORDER` and whichever profiles should run it.
+Its one-line summary lives in the `MODULE_DESC` table at the top. Adding a step
+means writing those two functions, adding its options with `defopt`, and adding
+its name to `MODULE_DESC`, `SV_MODULE_ORDER` and whichever profile should run
+it.
 
 Install is a download and a checksum:
 
@@ -120,7 +124,9 @@ habit worth keeping in a security tool.
 
 ## Testing
 
-- `shellcheck` over every file, clean at warning level.
+- `shellcheck` over every file, clean at its default severity.
+- `tests/readme-commands.sh` parses every command the README tells people to
+  run, so a renamed flag cannot quietly rot the documentation.
 - `tests/integration/run.sh <suite>` builds a throwaway root filesystem with
   debootstrap, runs the modules in it, and checks: a dry run writes nothing,
   the applied state is what was asked for, `scan` agrees, a second run reports

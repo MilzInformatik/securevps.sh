@@ -2,29 +2,22 @@
 #
 # securevps.sh - harden a Debian or Ubuntu VPS.
 #
-# Every hardening step is a module that can run on its own, takes flags, is
-# idempotent, and can be reverted. Nothing is written without a backup first.
+# Every hardening step is a command that runs on its own, takes flags, is
+# idempotent, and can be undone.
 #
-#   securevps.sh harden                       run the standard profile
-#   securevps.sh ssh --port 2222              one module, tuned
-#   securevps.sh scan                         read-only report
-#   securevps.sh revert ssh                   undo it
+#   securevps.sh harden                 run every step in the profile
+#   securevps.sh ssh --port 2222        one step, tuned
+#   securevps.sh scan                   read-only report
+#   securevps.sh revert ssh             undo it
 #
-# Layout of this file:
-#   1  constants and globals
-#   2  output
-#   3  option table
-#   4  system detection
-#   5  packages and services
-#   6  files, backups, revert
-#   7  scan reporting
-#   8  argument parsing
-#   9  modules
-#   10 commands and dispatch
+# The file reads top to bottom in three parts: the helpers every command is
+# built from, the settings table, then the commands themselves. Each command
+# carries a description of what it changes and why above it.
 #
 # https://github.com/MilzInformatik/securevps.sh
 
 set -euo pipefail
+
 
 # --------------------------------------------------------------------------
 # 1. constants and globals
@@ -33,7 +26,6 @@ set -euo pipefail
 readonly SV_VERSION="0.1.0"
 readonly SV_BACKUP_ROOT="/var/backups/securevps"
 readonly SV_STATE_DIR="/var/lib/securevps"
-readonly SV_DEFAULT_CONFIG="/etc/securevps.conf"
 
 # Modules in the order harden runs them. Order matters: the firewall opens the
 # new SSH port before the ssh module moves sshd onto it, and docker comes after
@@ -47,11 +39,7 @@ readonly SV_MODULE_ORDER=(
 readonly SV_PROFILE_MINIMAL=(updates ssh firewall bruteforce sysctl time banner)
 readonly SV_PROFILE_STANDARD=(
   updates user firewall ssh docker bruteforce sysctl kmodules
-  pam services time logging apparmor banner
-)
-readonly SV_PROFILE_PARANOID=(
-  updates user firewall ssh docker bruteforce sysctl kmodules
-  pam services time logging apparmor banner mounts integrity
+  pam services time logging apparmor banner mounts
 )
 
 # Runtime state.
@@ -85,8 +73,33 @@ SV_IS_CONTAINER=0
 SV_CLIENT_IP=""
 SV_CURRENT_SSH_PORTS=""
 
+# One line per module for the help output.
+declare -A MODULE_DESC=(
+  [updates]="security patches, applied now and automatically"
+  [user]="a non-root administrator, and root locked down behind it"
+  [firewall]="default-deny inbound with only the ports you asked for"
+  [ssh]="key-only sshd with modern crypto and a rollback timer"
+  [docker]="stop published container ports bypassing the firewall"
+  [bruteforce]="ban addresses that keep failing to log in"
+  [sysctl]="kernel and network stack hardening"
+  [kmodules]="blacklist filesystems and protocols a VPS never uses"
+  [pam]="password quality, lockout after repeated failures, ageing"
+  [services]="stop and disable services a VPS rarely needs"
+  [time]="a correct clock, which TLS and log correlation depend on"
+  [logging]="logs that survive a reboot and an audit trail"
+  [apparmor]="AppArmor profiles in enforce rather than complain mode"
+  [banner]="a legal warning banner, and no OS version before login"
+  [mounts]="nodev, nosuid and noexec on the writable scratch directories"
+  [integrity]="AIDE, so you can tell what changed on disk (off by default)"
+  [mfa]="a TOTP code on top of the SSH key (off by default)"
+  [vpn]="WireGuard or Tailscale, so SSH need not face the internet"
+  [alerts]="tell someone when a person logs in (off by default)"
+  [backup]="restic and a timer, pointed at a repository you supply"
+)
+
+
 # --------------------------------------------------------------------------
-# 2. output
+# 2. helpers: output
 # --------------------------------------------------------------------------
 
 if [[ -t 1 && "${NO_COLOR:-}" == "" && "${TERM:-dumb}" != "dumb" ]]; then
@@ -140,232 +153,9 @@ sv_confirm() {
   [[ "${reply,,}" == "y" || "${reply,,}" == "yes" ]]
 }
 
-# --------------------------------------------------------------------------
-# 3. option table
-# --------------------------------------------------------------------------
-#
-# Every setting lives in CFG under a "<module>.<name>" key. The same key is
-# reachable three ways, in increasing precedence:
-#
-#   default in the table below
-#   config file line      ssh.port = 2222
-#   command line flag     --ssh-port 2222
-#
-# Booleans are always named positively, so --docker-daemon-config turns a
-# thing on and --no-docker-daemon-config turns it off. When a single module
-# runs, its own prefix is optional: "securevps.sh ssh --port 2222".
-
-declare -A CFG=()
-declare -A OPT_TYPE=()
-declare -A OPT_HELP=()
-declare -a OPT_ORDER=()
-
-defopt() {
-  local key="$1" type="$2" default="$3" help="$4"
-  CFG["$key"]="$default"
-  OPT_TYPE["$key"]="$type"
-  OPT_HELP["$key"]="$help"
-  OPT_ORDER+=("$key")
-}
-
-sv_get() { printf '%s' "${CFG[$1]-}"; }
-sv_bool() { [[ "${CFG[$1]-}" == "true" ]]; }
-sv_int() { printf '%s' "${CFG[$1]-0}"; }
-
-declare -A SV_EXPLICIT=()
-
-sv_set() {
-  local key="$1" value="$2"
-  [[ -n "${OPT_TYPE[$key]-}" ]] || sv_die "unknown setting: $key"
-  SV_EXPLICIT["$key"]=1
-  case "${OPT_TYPE[$key]}" in
-    bool)
-      case "${value,,}" in
-        true|yes|on|1) value=true ;;
-        false|no|off|0) value=false ;;
-        *) sv_die "setting $key takes true or false, got '$value'" ;;
-      esac
-      ;;
-    int)
-      [[ "$value" =~ ^[0-9]+$ ]] || sv_die "setting $key takes a number, got '$value'"
-      ;;
-  esac
-  CFG["$key"]="$value"
-}
-
-# --- core -----------------------------------------------------------------
-defopt core.dry-run  bool false    "print every change as a diff, write nothing"
-defopt core.yes      bool false    "answer every prompt with yes"
-defopt core.verbose  bool false    "log what each check is doing"
-defopt core.quiet    bool false    "only errors"
-defopt core.json     bool false    "machine-readable output, mainly for scan"
-defopt core.profile  str  standard "minimal, standard or paranoid"
-defopt core.config   str  ""       "config file to read (default $SV_DEFAULT_CONFIG)"
-defopt core.backup   bool true     "back up every file before editing it"
-defopt core.only     str  ""       "comma-separated modules to run"
-defopt core.skip     str  ""       "comma-separated modules to leave out"
-defopt core.force    bool false    "carry on past safety checks that would normally stop the run"
-
-# --- updates --------------------------------------------------------------
-defopt updates.upgrade      bool true     "run a full package upgrade now"
-defopt updates.auto         bool true     "install and enable unattended-upgrades"
-defopt updates.scope        str  security "which pocket auto-updates draw from: security or all"
-defopt updates.autoremove   bool true     "remove orphaned packages and old kernels"
-defopt updates.auto-reboot  str  ""       "reboot automatically at HH:MM when a patch needs it"
-defopt updates.needrestart  bool true     "restart services automatically after a library patch"
-
-# --- user -----------------------------------------------------------------
-defopt user.create         bool true     "create a non-root administrator"
-defopt user.name           str  deploy   "name of that administrator"
-defopt user.ssh-key        str  ""       "public key or path to one, defaults to root's authorized_keys"
-defopt user.shell          str  /bin/bash "login shell for the new user"
-defopt user.lock-root      bool true     "lock root's password, key login still works"
-defopt user.sudo-nopasswd  bool false    "let the admin sudo without a password"
-defopt user.umask          str  027      "default umask for login shells"
-defopt user.restrict-su    bool true     "only the sudo group may run su"
-
-# --- ssh ------------------------------------------------------------------
-defopt ssh.port              int  22    "port sshd listens on"
-defopt ssh.password-auth     bool false "allow password logins"
-defopt ssh.permit-root       str  no    "PermitRootLogin: no, prohibit-password or yes"
-defopt ssh.allow-users       str  ""    "comma-separated AllowUsers list"
-defopt ssh.allow-groups      str  sudo  "comma-separated AllowGroups list, empty to omit"
-defopt ssh.max-auth-tries    int  3     "MaxAuthTries"
-defopt ssh.login-grace       int  30    "LoginGraceTime in seconds"
-defopt ssh.client-alive      int  300   "ClientAliveInterval in seconds"
-defopt ssh.tcp-forwarding    bool false "allow TCP forwarding, needed for SSH tunnels to admin UIs"
-defopt ssh.agent-forwarding  bool false "allow agent forwarding"
-defopt ssh.x11-forwarding    bool false "allow X11 forwarding"
-defopt ssh.gateway-ports     bool false "allow remote hosts to use forwarded ports"
-defopt ssh.modern-crypto     bool true  "restrict KEX, ciphers and MACs to the modern set"
-defopt ssh.regen-hostkeys    bool true  "drop obsolete host keys and make sure ed25519 and RSA 4096 exist"
-defopt ssh.drop-ecdsa        bool false "also remove the ECDSA host key, changes the fingerprint clients see"
-defopt ssh.moduli            bool true  "remove DH moduli smaller than 3072 bits"
-defopt ssh.disable-pam       bool false "UsePAM no, see the catalog before turning this on"
-defopt ssh.rollback-timeout  int  300   "seconds before an unconfirmed sshd change rolls back, 0 to disable"
-
-# --- firewall -------------------------------------------------------------
-defopt firewall.backend     str  auto  "ufw, nftables or auto"
-defopt firewall.enable      bool true  "turn the firewall on"
-defopt firewall.allow       str  ""    "extra ports to open, e.g. 80,443,25/tcp"
-defopt firewall.allow-from  str  ""    "source-restricted rules, e.g. 10.0.0.0/8:5432"
-defopt firewall.ssh-limit   bool true  "rate-limit new SSH connections"
-defopt firewall.ipv6        bool true  "mirror every rule onto IPv6"
-defopt firewall.log-level   str  low   "off, low, medium, high or full"
-defopt firewall.block-ping  bool false "drop inbound ICMP echo requests"
-
-# --- docker ---------------------------------------------------------------
-defopt docker.firewall-fix       bool true  "stop published container ports bypassing the firewall"
-defopt docker.allow-from         str  ""    "extra CIDRs allowed to reach published ports"
-defopt docker.allow-published    str  ""    "container ports to expose publicly anyway, e.g. 80,443"
-defopt docker.daemon-config      bool true  "manage /etc/docker/daemon.json"
-defopt docker.no-new-privileges  bool true  "block setuid privilege escalation inside containers"
-defopt docker.icc                bool true  "allow container-to-container traffic on the default bridge"
-defopt docker.live-restore       bool true  "keep containers running across daemon restarts"
-defopt docker.userland-proxy     bool false "use the userland proxy instead of iptables hairpin NAT"
-defopt docker.log-max-size       str  10m   "per-container log file size before rotation"
-defopt docker.log-max-file       int  3     "how many rotated log files to keep"
-defopt docker.only-rules         bool false "reapply the DOCKER-USER rules and nothing else, used by the systemd unit"
-
-# --- bruteforce -----------------------------------------------------------
-defopt bruteforce.engine          str  fail2ban "fail2ban, crowdsec or none"
-defopt bruteforce.maxretry        int  5        "failures before a ban"
-defopt bruteforce.findtime        str  10m      "window those failures are counted in"
-defopt bruteforce.bantime         str  1h       "how long a ban lasts"
-defopt bruteforce.recidive        bool true     "ban repeat offenders for a week"
-defopt bruteforce.aggressive      bool false    "match probes that never reach a password prompt"
-defopt bruteforce.ignore-ip       str  ""       "never ban these addresses"
-defopt bruteforce.auto-ignore-ip  bool true     "also never ban the address you are connected from"
-
-# --- sysctl ---------------------------------------------------------------
-defopt sysctl.network       bool true  "network stack hardening"
-defopt sysctl.kernel        bool true  "kernel information and feature restrictions"
-defopt sysctl.filesystem    bool true  "link protections and core dump restrictions"
-defopt sysctl.ipv6          bool true  "keep IPv6 enabled"
-defopt sysctl.ip-forward    str  auto  "on, off or auto, which keeps it on when Docker is present"
-defopt sysctl.ptrace-scope  int  1     "yama ptrace_scope, 2 blocks debuggers entirely"
-defopt sysctl.userns        bool true  "keep unprivileged user namespaces, containers need them"
-
-# --- kmodules -------------------------------------------------------------
-defopt kmodules.filesystems  bool true  "blacklist cramfs, freevxfs, jffs2, hfs, hfsplus, udf"
-defopt kmodules.protocols    bool true  "blacklist dccp, sctp, rds, tipc"
-defopt kmodules.firewire     bool true  "blacklist firewire DMA modules"
-defopt kmodules.usb-storage  bool false "blacklist usb-storage"
-defopt kmodules.extra        str  ""    "extra modules to blacklist, comma separated"
-
-# --- mounts ---------------------------------------------------------------
-defopt mounts.dev-shm     bool true  "nodev,nosuid,noexec on /dev/shm"
-defopt mounts.var-tmp     bool true  "nodev,nosuid,noexec on /var/tmp"
-defopt mounts.tmp         bool true  "nodev,nosuid on /tmp"
-defopt mounts.noexec-tmp  bool false "also noexec on /tmp, breaks some installers"
-defopt mounts.home-nodev  bool false "nodev,nosuid on /home"
-
-# --- pam ------------------------------------------------------------------
-defopt pam.pwquality        bool true "enforce password complexity"
-defopt pam.min-length       int  12   "minimum password length"
-defopt pam.min-classes      int  3    "minimum character classes"
-defopt pam.remember         int  5    "how many old passwords cannot be reused"
-defopt pam.faillock         bool true "lock an account after repeated failures"
-defopt pam.faillock-deny    int  5    "failures before the lock"
-defopt pam.faillock-unlock  int  900  "seconds before it unlocks"
-defopt pam.login-defs       bool true "manage /etc/login.defs"
-defopt pam.pass-max-days    int  365  "password maximum age"
-defopt pam.tmout            int  0    "idle shell timeout in seconds, 0 to leave shells alone"
-
-# --- services -------------------------------------------------------------
-defopt services.disable  bool true "stop and disable services a VPS rarely needs"
-defopt services.purge    bool false "also uninstall them"
-defopt services.keep     str  ""    "services to leave alone, comma separated"
-defopt services.extra    str  ""    "extra services to disable, comma separated"
-
-# --- time -----------------------------------------------------------------
-defopt time.chrony      bool true "install chrony rather than relying on timesyncd"
-defopt time.timezone    str  UTC  "system timezone"
-defopt time.ntp-server  str  ""   "override the NTP pool"
-
-# --- logging --------------------------------------------------------------
-defopt logging.journald           bool true    "persistent journal with a size cap"
-defopt logging.journal-max        str  1G      "disk the journal may use"
-defopt logging.journal-retention  str  1month  "how long to keep journal entries"
-defopt logging.auditd             bool true    "install and enable auditd"
-defopt logging.audit-rules        str  light   "light, cis or none"
-defopt logging.remote-syslog      str  ""      "forward syslog to host:port"
-
-# --- apparmor -------------------------------------------------------------
-defopt apparmor.enforce  bool true "put every loaded profile into enforce mode"
-
-# --- banner ---------------------------------------------------------------
-defopt banner.issue  bool true "warning banner in /etc/issue and /etc/issue.net"
-defopt banner.motd   bool true "replace the dynamic motd"
-defopt banner.file   str  ""   "read the banner text from this file instead"
-
-# --- integrity ------------------------------------------------------------
-defopt integrity.enable    bool false "install AIDE and build its database"
-defopt integrity.schedule  str  daily "systemd OnCalendar expression for the check"
-
-# --- mfa ------------------------------------------------------------------
-defopt mfa.enable       bool false "require a TOTP code in addition to the SSH key"
-defopt mfa.exempt-user   str  ""   "users that keep key-only login, e.g. a deploy account"
-
-# --- vpn ------------------------------------------------------------------
-defopt vpn.provider           str  none  "none, wireguard or tailscale"
-defopt vpn.tailscale-authkey  str  ""    "Tailscale auth key for unattended enrolment"
-defopt vpn.wg-port            int  51820 "WireGuard listen port"
-defopt vpn.ssh-vpn-only       bool false "restrict SSH to the VPN interface, closes the public port"
-
-# --- alerts ---------------------------------------------------------------
-defopt alerts.login-alert  bool false "notify on every interactive SSH login"
-defopt alerts.email        str  ""    "address for notifications"
-defopt alerts.webhook      str  ""    "URL to POST notifications to"
-
-# --- backup ---------------------------------------------------------------
-defopt backup.enable         bool false "install restic and a scheduled backup job"
-defopt backup.repo           str  ""    "restic repository URL"
-defopt backup.password-file  str  ""    "file holding the repository password"
-defopt backup.schedule       str  daily "systemd OnCalendar expression"
 
 # --------------------------------------------------------------------------
-# 4. system detection
+# 3. helpers: system detection
 # --------------------------------------------------------------------------
 
 sv_detect_system() {
@@ -426,8 +216,9 @@ sv_require_root() {
 
 sv_has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+
 # --------------------------------------------------------------------------
-# 5. packages and services
+# 4. helpers: packages and services
 # --------------------------------------------------------------------------
 
 SV_APT_UPDATED=0
@@ -545,9 +336,11 @@ sv_sshd_socket_activated() {
   sv_unit_exists ssh.socket && sv_unit_enabled ssh.socket
 }
 
+
 # --------------------------------------------------------------------------
-# 6. files, backups, revert
+# 5. helpers: files and backups
 # --------------------------------------------------------------------------
+
 #
 # Nothing here writes to a file without first copying it into
 # /var/backups/securevps/<run id>/ and appending a line to that run's
@@ -644,6 +437,25 @@ sv_write_file() {
 # The generator writes the intended content to stdout. This wrapper exists
 # because piping into sv_write_file would run it in a subshell, where the
 # SV_CHANGED flag it sets could never reach the caller.
+# The timer half of a scheduled job. The service half differs enough between
+# callers to be worth writing out; this does not.
+sv_timer_unit() {
+  local module="$1" name="$2" description="$3" schedule="$4"
+  sv_write_file "$module" "/etc/systemd/system/$name.timer" 0644 <<EOF
+$(sv_managed_header)
+[Unit]
+Description=$description
+
+[Timer]
+OnCalendar=$schedule
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
 sv_write_gen() {
   local module="$1" path="$2" mode="$3"; shift 3
   local tmp; tmp="$(mktemp)"
@@ -743,8 +555,9 @@ sv_revert_entry() {
   esac
 }
 
+
 # --------------------------------------------------------------------------
-# 7. scan reporting
+# 6. helpers: scan reporting
 # --------------------------------------------------------------------------
 
 sv_check() {
@@ -773,6 +586,19 @@ sv_check() {
   printf '  %s  %-28s %s\n' "$mark" "$module.$id" "$message"
 }
 
+# Run a command and look for a fixed string in its output.
+sv_grep_cmd() {
+  local pattern="$1"; shift
+  "$@" 2>/dev/null | grep -qF -- "$pattern"
+}
+
+# Invert a command's status, so a check can read as the good state.
+sv_not() { ! "$@" >/dev/null 2>&1; }
+
+sv_root_password_locked() {
+  passwd -S root 2>/dev/null | awk '{print $2}' | grep -qE '^(L|LK)$'
+}
+
 sv_json_escape() {
   local s="$1"
   s="${s//\\/\\\\}"
@@ -782,11 +608,27 @@ sv_json_escape() {
   printf '%s' "$s"
 }
 
-# Convenience: pass when the condition holds, fail otherwise.
-sv_check_if() {
-  local module="$1" id="$2" message="$3"; shift 3
-  if "$@" >/dev/null 2>&1; then sv_check pass "$module" "$id" "$message"
-  else sv_check fail "$module" "$id" "$message"; fi
+# Pass when the command succeeds. The two messages describe the good and the
+# bad state, because "no warning banner before login" is more use than a
+# negated restatement of the check.
+sv_verdict() {
+  local module="$1" id="$2" good="$3" bad="$4"; shift 4
+  if "$@" >/dev/null 2>&1; then sv_check pass "$module" "$id" "$good"
+  else sv_check fail "$module" "$id" "$bad"; fi
+}
+
+# Pass when a value is one of the accepted ones.
+sv_expect() {
+  local module="$1" id="$2" label="$3" got="$4"; shift 4
+  local want
+  for want in "$@"; do
+    if [[ "$got" == "$want" ]]; then
+      sv_check pass "$module" "$id" "$label is $got"
+      return 0
+    fi
+  done
+  sv_check fail "$module" "$id" "$label is ${got:-unset}, wanted ${*// / or }"
+  return 0
 }
 
 # Read one effective sshd setting. Empty when sshd cannot be queried.
@@ -794,17 +636,242 @@ sv_sshd_get() {
   sshd -T 2>/dev/null | awk -v k="${1,,}" '$1==k {$1=""; sub(/^ /,""); print; exit}'
 }
 
+
 # --------------------------------------------------------------------------
-# 9. modules
+# 7. settings
 # --------------------------------------------------------------------------
+
+# Every setting lives in CFG under a "<module>.<name>" key, and every one of
+# them is a command line flag. Booleans are always named positively, so
+# --docker-daemon-config turns a thing on and --no-docker-daemon-config turns
+# it off. When a single module runs its own prefix is optional, so
+# "securevps.sh ssh --port 2222" and "securevps.sh harden --ssh-port 2222"
+# set the same thing.
+
+declare -A CFG=()
+declare -A OPT_TYPE=()
+declare -A OPT_HELP=()
+declare -a OPT_ORDER=()
+
+defopt() {
+  local key="$1" type="$2" default="$3" help="$4"
+  CFG["$key"]="$default"
+  OPT_TYPE["$key"]="$type"
+  OPT_HELP["$key"]="$help"
+  OPT_ORDER+=("$key")
+}
+
+sv_get() { printf '%s' "${CFG[$1]-}"; }
+sv_bool() { [[ "${CFG[$1]-}" == "true" ]]; }
+sv_int() { printf '%s' "${CFG[$1]-0}"; }
+
+sv_set() {
+  local key="$1" value="$2"
+  [[ -n "${OPT_TYPE[$key]-}" ]] || sv_die "unknown setting: $key"
+  case "${OPT_TYPE[$key]}" in
+    bool)
+      case "${value,,}" in
+        true|yes|on|1) value=true ;;
+        false|no|off|0) value=false ;;
+        *) sv_die "setting $key takes true or false, got '$value'" ;;
+      esac
+      ;;
+    int)
+      [[ "$value" =~ ^[0-9]+$ ]] || sv_die "setting $key takes a number, got '$value'"
+      ;;
+  esac
+  CFG["$key"]="$value"
+}
+
+# --- core -----------------------------------------------------------------
+defopt core.dry-run  bool false    "print every change as a diff, write nothing"
+defopt core.yes      bool false    "answer every prompt with yes"
+defopt core.verbose  bool false    "log what each check is doing"
+defopt core.quiet    bool false    "only errors"
+defopt core.json     bool false    "machine-readable output, mainly for scan"
+defopt core.profile  str  standard "minimal or standard"
+defopt core.backup   bool true     "back up every file before editing it"
+defopt core.only     str  ""       "comma-separated modules to run"
+defopt core.skip     str  ""       "comma-separated modules to leave out"
+defopt core.force    bool false    "carry on past safety checks that would normally stop the run"
+
+# --- updates --------------------------------------------------------------
+defopt updates.upgrade      bool true     "run a full package upgrade now"
+defopt updates.auto         bool true     "install and enable unattended-upgrades"
+defopt updates.scope        str  security "which pocket auto-updates draw from: security or all"
+defopt updates.autoremove   bool true     "remove orphaned packages and old kernels"
+defopt updates.auto-reboot  str  ""       "reboot automatically at HH:MM when a patch needs it"
+defopt updates.needrestart  bool true     "restart services automatically after a library patch"
+
+# --- user -----------------------------------------------------------------
+defopt user.create         bool true     "create a non-root administrator"
+defopt user.name           str  deploy   "name of that administrator"
+defopt user.ssh-key        str  ""       "public key or path to one, defaults to root's authorized_keys"
+defopt user.shell          str  /bin/bash "login shell for the new user"
+defopt user.lock-root      bool true     "lock root's password, key login still works"
+defopt user.sudo-nopasswd  bool false    "let the admin sudo without a password"
+defopt user.umask          str  027      "default umask for login shells"
+defopt user.restrict-su    bool true     "only the sudo group may run su"
+
+# --- ssh ------------------------------------------------------------------
+defopt ssh.port              int  22    "port sshd listens on"
+defopt ssh.password-auth     bool false "allow password logins"
+defopt ssh.permit-root       str  no    "PermitRootLogin: no, prohibit-password or yes"
+defopt ssh.allow-users       str  ""    "comma-separated AllowUsers list"
+defopt ssh.allow-groups      str  sudo  "comma-separated AllowGroups list, empty to omit"
+defopt ssh.max-auth-tries    int  3     "MaxAuthTries"
+defopt ssh.login-grace       int  30    "LoginGraceTime in seconds"
+defopt ssh.client-alive      int  300   "ClientAliveInterval in seconds"
+defopt ssh.tcp-forwarding    bool false "allow TCP forwarding, needed for SSH tunnels to admin UIs"
+defopt ssh.agent-forwarding  bool false "allow agent forwarding"
+defopt ssh.x11-forwarding    bool false "allow X11 forwarding"
+defopt ssh.gateway-ports     bool false "allow remote hosts to use forwarded ports"
+defopt ssh.modern-crypto     bool true  "restrict KEX, ciphers and MACs to the modern set"
+defopt ssh.regen-hostkeys    bool true  "drop obsolete host keys and make sure ed25519 and RSA 4096 exist"
+defopt ssh.drop-ecdsa        bool false "also remove the ECDSA host key, changes the fingerprint clients see"
+defopt ssh.moduli            bool true  "remove DH moduli smaller than 3072 bits"
+defopt ssh.disable-pam       bool false "UsePAM no, see the catalog before turning this on"
+defopt ssh.rollback-timeout  int  300   "seconds before an unconfirmed sshd change rolls back, 0 to disable"
+
+# --- firewall -------------------------------------------------------------
+defopt firewall.backend     str  auto  "ufw, nftables or auto"
+defopt firewall.enable      bool true  "turn the firewall on"
+defopt firewall.allow       str  ""    "extra ports to open, e.g. 80,443,25/tcp"
+defopt firewall.allow-from  str  ""    "source-restricted rules, e.g. 10.0.0.0/8:5432"
+defopt firewall.ssh-limit   bool true  "rate-limit new SSH connections"
+defopt firewall.ipv6        bool true  "mirror every rule onto IPv6"
+defopt firewall.log-level   str  low   "off, low, medium, high or full"
+defopt firewall.block-ping  bool false "drop inbound ICMP echo requests"
+
+# --- docker ---------------------------------------------------------------
+defopt docker.firewall-fix       bool true  "stop published container ports bypassing the firewall"
+defopt docker.allow-from         str  ""    "extra CIDRs allowed to reach published ports"
+defopt docker.allow-published    str  ""    "container ports to expose publicly anyway, e.g. 80,443"
+defopt docker.daemon-config      bool true  "manage /etc/docker/daemon.json"
+defopt docker.no-new-privileges  bool true  "block setuid privilege escalation inside containers"
+defopt docker.icc                bool true  "allow container-to-container traffic on the default bridge"
+defopt docker.live-restore       bool true  "keep containers running across daemon restarts"
+defopt docker.userland-proxy     bool false "use the userland proxy instead of iptables hairpin NAT"
+defopt docker.log-max-size       str  10m   "per-container log file size before rotation"
+defopt docker.log-max-file       int  3     "how many rotated log files to keep"
+defopt docker.only-rules         bool false "reapply the DOCKER-USER rules and nothing else, used by the systemd unit"
+
+# --- bruteforce -----------------------------------------------------------
+defopt bruteforce.engine          str  fail2ban "fail2ban, crowdsec or none"
+defopt bruteforce.maxretry        int  5        "failures before a ban"
+defopt bruteforce.findtime        str  10m      "window those failures are counted in"
+defopt bruteforce.bantime         str  1h       "how long a ban lasts"
+defopt bruteforce.recidive        bool true     "ban repeat offenders for a week"
+defopt bruteforce.aggressive      bool true     "match probes that never reach a password prompt"
+defopt bruteforce.ignore-ip       str  ""       "never ban these addresses"
+defopt bruteforce.auto-ignore-ip  bool true     "also never ban the address you are connected from"
+
+# --- sysctl ---------------------------------------------------------------
+defopt sysctl.network       bool true  "network stack hardening"
+defopt sysctl.kernel        bool true  "kernel information and feature restrictions"
+defopt sysctl.filesystem    bool true  "link protections and core dump restrictions"
+defopt sysctl.ipv6          bool true  "keep IPv6 enabled"
+defopt sysctl.ip-forward    str  auto  "on, off or auto, which keeps it on when Docker is present"
+defopt sysctl.ptrace-scope  int  1     "yama ptrace_scope, 2 blocks debuggers entirely"
+defopt sysctl.userns        bool true  "keep unprivileged user namespaces, containers need them"
+
+# --- kmodules -------------------------------------------------------------
+defopt kmodules.filesystems  bool true  "blacklist cramfs, freevxfs, jffs2, hfs, hfsplus, udf"
+defopt kmodules.protocols    bool true  "blacklist dccp, sctp, rds, tipc"
+defopt kmodules.firewire     bool true  "blacklist firewire DMA modules"
+defopt kmodules.usb-storage  bool false "blacklist usb-storage"
+defopt kmodules.extra        str  ""    "extra modules to blacklist, comma separated"
+
+# --- mounts ---------------------------------------------------------------
+# /dev/shm is the one that is pure win: nothing legitimate executes or makes
+# device nodes there, and it is a favourite staging area for exploits. /tmp
+# and /var/tmp are opt-in because package installers and image builds do run
+# scripts out of them.
+defopt mounts.dev-shm     bool true  "nodev,nosuid,noexec on /dev/shm"
+defopt mounts.var-tmp     bool false "nodev,nosuid,noexec on /var/tmp"
+defopt mounts.tmp         bool false "make /tmp a tmpfs with nodev,nosuid"
+defopt mounts.noexec-tmp  bool false "also noexec on /tmp, breaks some installers"
+
+# --- pam ------------------------------------------------------------------
+defopt pam.pwquality        bool true "enforce password complexity"
+defopt pam.min-length       int  12   "minimum password length"
+defopt pam.min-classes      int  3    "minimum character classes"
+defopt pam.remember         int  5    "how many old passwords cannot be reused"
+defopt pam.faillock         bool true "lock an account after repeated failures"
+defopt pam.faillock-deny    int  5    "failures before the lock"
+defopt pam.faillock-unlock  int  900  "seconds before it unlocks"
+defopt pam.login-defs       bool true "manage /etc/login.defs"
+defopt pam.pass-max-days    int  365  "password maximum age"
+defopt pam.tmout            int  0    "idle shell timeout in seconds, 0 to leave shells alone"
+
+# --- services -------------------------------------------------------------
+defopt services.disable  bool true "stop and disable services a VPS rarely needs"
+defopt services.purge    bool false "also uninstall them"
+defopt services.keep     str  ""    "services to leave alone, comma separated"
+defopt services.extra    str  ""    "extra services to disable, comma separated"
+
+# --- time -----------------------------------------------------------------
+defopt time.chrony      bool true "install chrony rather than relying on timesyncd"
+defopt time.timezone    str  UTC  "system timezone"
+defopt time.ntp-server  str  ""   "override the NTP pool"
+
+# --- logging --------------------------------------------------------------
+defopt logging.journald           bool true    "persistent journal with a size cap"
+defopt logging.journal-max        str  1G      "disk the journal may use"
+defopt logging.journal-retention  str  1month  "how long to keep journal entries"
+defopt logging.auditd             bool true    "install and enable auditd"
+defopt logging.audit-rules        str  light   "light, cis or none"
+defopt logging.remote-syslog      str  ""      "forward syslog to host:port"
+
+# --- apparmor -------------------------------------------------------------
+defopt apparmor.enforce  bool true "put every loaded profile into enforce mode"
+
+# --- banner ---------------------------------------------------------------
+defopt banner.issue  bool true "warning banner in /etc/issue and /etc/issue.net"
+defopt banner.motd   bool true "replace the dynamic motd"
+defopt banner.file   str  ""   "read the banner text from this file instead"
+
+# --- integrity ------------------------------------------------------------
+defopt integrity.enable    bool false "install AIDE and build its database"
+defopt integrity.schedule  str  daily "systemd OnCalendar expression for the check"
+
+# --- mfa ------------------------------------------------------------------
+defopt mfa.enable       bool false "require a TOTP code in addition to the SSH key"
+defopt mfa.exempt-user   str  ""   "users that keep key-only login, e.g. a deploy account"
+
+# --- vpn ------------------------------------------------------------------
+defopt vpn.provider           str  none  "none, wireguard or tailscale"
+defopt vpn.tailscale-authkey  str  ""    "Tailscale auth key for unattended enrolment"
+defopt vpn.wg-port            int  51820 "WireGuard listen port"
+defopt vpn.ssh-vpn-only       bool false "restrict SSH to the VPN interface, closes the public port"
+
+# --- alerts ---------------------------------------------------------------
+defopt alerts.login-alert  bool false "notify on every interactive SSH login"
+defopt alerts.email        str  ""    "address for notifications"
+defopt alerts.webhook      str  ""    "URL to POST notifications to"
+
+# --- backup ---------------------------------------------------------------
+defopt backup.enable         bool false "install restic and a scheduled backup job"
+defopt backup.repo           str  ""    "restic repository URL"
+defopt backup.password-file  str  ""    "file holding the repository password"
+defopt backup.schedule       str  daily "systemd OnCalendar expression"
+
+
+# --------------------------------------------------------------------------
+# 8. commands
+# --------------------------------------------------------------------------
+
 #
-# Each module <m> provides:
+# Each hardening step <m> is two functions:
+#
 #   <m>_apply   make the changes
-#   <m>_scan    report on them, writing results with sv_check
-#   <m>_desc    one line for the help output
+#   <m>_scan    report on them, one sv_check per finding
 #
-# Modules never call exit. They return non-zero to mark themselves failed and
-# let the rest of the run continue.
+# Its one-line summary lives in MODULE_DESC at the top of the file, and the
+# block above each pair says what it changes and why.
+#
+# A step never calls exit. It returns non-zero to mark itself failed and lets
+# the rest of the run carry on.
 
 # Append a line to a file we do not own, if no line matching <regex> is there.
 sv_ensure_line() {
@@ -830,10 +897,16 @@ EOF
 }
 
 # ==========================================================================
-# updates - patching
+# updates - security patches, applied now and automatically
 # ==========================================================================
+#
+# Installs what is pending, then turns on unattended-upgrades restricted to
+# the security pocket so it keeps happening without you. needrestart is set
+# to restart services by itself, which matters more than it sounds: patching
+# a library does nothing for the processes that already mapped the old one.
+#
+# Automatic reboots stay off. --updates-auto-reboot 04:00 turns them on.
 
-updates_desc() { printf 'security patches, applied now and automatically'; }
 
 updates_apply() {
   sv_header "updates"
@@ -934,11 +1007,9 @@ EOF
 }
 
 updates_scan() {
-  if sv_pkg_installed unattended-upgrades; then
-    sv_check pass updates unattended-upgrades "unattended-upgrades installed"
-  else
-    sv_check fail updates unattended-upgrades "unattended-upgrades not installed"
-  fi
+  sv_verdict updates unattended-upgrades \
+    "unattended-upgrades installed" "unattended-upgrades not installed" \
+    sv_pkg_installed unattended-upgrades
 
   if [[ -f /etc/apt/apt.conf.d/99securevps-periodic ]] \
      && grep -q 'Unattended-Upgrade "1"' /etc/apt/apt.conf.d/99securevps-periodic 2>/dev/null; then
@@ -968,12 +1039,14 @@ updates_scan() {
 }
 
 # ==========================================================================
-# user - accounts and privilege
+# user - a non-root administrator, and root locked down behind it
 # ==========================================================================
+#
+# Creates the account, puts it in sudo, copies root's authorized keys across,
+# and locks root's password. That last step is guarded: it checks some
+# non-root account really has a key and sudo rights first. A script that
+# locks root on a box with no other way in has not hardened anything.
 
-user_desc() { printf 'a non-root administrator, and root locked down behind it'; }
-
-# Collect public keys from the flag, a file, or root's authorized_keys.
 user_collect_keys() {
   local src; src="$(sv_get user.ssh-key)"
   if [[ -n "$src" ]]; then
@@ -1071,7 +1144,7 @@ EOF
     if user_root_lock_safe; then
       if sv_dry; then
         sv_would "passwd -l root"
-      elif passwd -S root 2>/dev/null | awk '{print $2}' | grep -qE '^(L|LK)$'; then
+      elif sv_root_password_locked; then
         sv_skip "root password already locked"
       else
         sv_record custom user "root-password-lock" ""
@@ -1121,11 +1194,8 @@ user_scan() {
     sv_check warn user admin "administrator $name does not exist"
   fi
 
-  if passwd -S root 2>/dev/null | awk '{print $2}' | grep -qE '^(L|LK)$'; then
-    sv_check pass user root-locked "root password is locked"
-  else
-    sv_check fail user root-locked "root password is not locked"
-  fi
+  sv_verdict user root-locked "root password is locked" "root password is not locked" \
+    sv_root_password_locked
 
   local empty; empty="$(awk -F: '($2==""){print $1}' /etc/shadow 2>/dev/null | tr '\n' ' ' || true)"
   if [[ -n "${empty// /}" ]]; then
@@ -1142,22 +1212,25 @@ user_scan() {
   fi
 
   local umask_now; umask_now="$(awk '/^UMASK/{print $2}' /etc/login.defs 2>/dev/null || true)"
-  if [[ "$umask_now" == "$(sv_get user.umask)" ]]; then
-    sv_check pass user umask "login umask is $umask_now"
-  else
-    sv_check fail user umask "login umask is ${umask_now:-unset}, wanted $(sv_get user.umask)"
-  fi
+  sv_expect user umask "login umask" "$umask_now" "$(sv_get user.umask)"
 }
 
 # ==========================================================================
-# ssh - remote access
+# ssh - key-only sshd with modern crypto and a rollback timer
 # ==========================================================================
+#
+# Password authentication off is the single most valuable line in the file.
+# Everything else here is worth less than that one.
+#
+# Three things stop this locking you out: it refuses a config no account
+# could log in through, it runs sshd -t before reloading and restores the
+# backup if that fails, and it arms a timer that puts the old config back
+# unless securevps.sh confirm runs from a second session.
+
 
 readonly SV_SSHD_DROPIN="/etc/ssh/sshd_config.d/99-securevps.conf"
 readonly SV_SSH_SOCKET_DROPIN="/etc/systemd/system/ssh.socket.d/99-securevps.conf"
 readonly SV_SSH_ROLLBACK="/usr/local/sbin/securevps-ssh-rollback"
-
-ssh_desc() { printf 'key-only sshd with modern crypto and a rollback timer'; }
 
 sv_onoff() { if sv_bool "$1"; then printf 'yes'; else printf 'no'; fi; }
 
@@ -1547,49 +1620,31 @@ ssh_scan() {
     return 0
   fi
 
+  sv_expect ssh password-auth   "password authentication" "$(sv_sshd_get passwordauthentication)" no
+  sv_expect ssh root-login      "PermitRootLogin" "$(sv_sshd_get permitrootlogin)" no prohibit-password
+  sv_expect ssh pubkey          "public key authentication" "$(sv_sshd_get pubkeyauthentication)" yes
+  sv_expect ssh empty-passwords "PermitEmptyPasswords" "$(sv_sshd_get permitemptypasswords)" no
+  sv_expect ssh x11             "X11Forwarding" "$(sv_sshd_get x11forwarding)" no
+
   local v
-  v="$(sv_sshd_get passwordauthentication)"
-  if [[ "$v" == "no" ]]; then sv_check pass ssh password-auth "password authentication is off"
-  else sv_check fail ssh password-auth "password authentication is ${v:-unknown}"; fi
-
-  v="$(sv_sshd_get permitrootlogin)"
-  if [[ "$v" == "no" || "$v" == "prohibit-password" ]]; then
-    sv_check pass ssh root-login "PermitRootLogin $v"
-  else sv_check fail ssh root-login "PermitRootLogin ${v:-unknown}"; fi
-
-  v="$(sv_sshd_get pubkeyauthentication)"
-  if [[ "$v" == "yes" ]]; then sv_check pass ssh pubkey "public key authentication is on"
-  else sv_check fail ssh pubkey "public key authentication is ${v:-unknown}"; fi
-
-  v="$(sv_sshd_get permitemptypasswords)"
-  if [[ "$v" == "no" ]]; then sv_check pass ssh empty-passwords "empty passwords refused"
-  else sv_check fail ssh empty-passwords "PermitEmptyPasswords ${v:-unknown}"; fi
-
   v="$(sv_sshd_get maxauthtries)"
   if [[ -n "$v" && "$v" -le 4 ]]; then sv_check pass ssh max-auth-tries "MaxAuthTries $v"
   else sv_check warn ssh max-auth-tries "MaxAuthTries ${v:-unknown}"; fi
-
-  v="$(sv_sshd_get x11forwarding)"
-  if [[ "$v" == "no" ]]; then sv_check pass ssh x11 "X11 forwarding off"
-  else sv_check warn ssh x11 "X11 forwarding is on"; fi
 
   v="$(sv_sshd_get port)"
   if [[ "$v" == "22" ]]; then sv_check warn ssh port "sshd is on the default port 22"
   else sv_check pass ssh port "sshd is on port $v"; fi
 
-  local weak_kex
-  weak_kex="$(sv_sshd_get kexalgorithms | tr ',' '\n' | grep -cE 'sha1|group1-|group14-sha1' || true)"
-  if [[ "${weak_kex:-0}" -eq 0 ]]; then sv_check pass ssh kex "no SHA-1 key exchange offered"
-  else sv_check fail ssh kex "$weak_kex key exchange algorithms use SHA-1"; fi
+  local weak
+  weak="$(sv_sshd_get kexalgorithms | tr ',' '\n' | grep -cE 'sha1|group1-|group14-sha1' || true)"
+  if [[ "${weak:-0}" -eq 0 ]]; then sv_check pass ssh kex "no SHA-1 key exchange offered"
+  else sv_check fail ssh kex "$weak key exchange algorithms use SHA-1"; fi
 
-  if [[ -f /etc/ssh/ssh_host_dsa_key ]]; then
-    sv_check fail ssh hostkeys "a DSA host key is still present"
-  else
-    sv_check pass ssh hostkeys "no obsolete host keys"
-  fi
+  sv_verdict ssh hostkeys "no obsolete host keys" "a DSA host key is still present" \
+    test ! -f /etc/ssh/ssh_host_dsa_key
 
   if [[ -f /etc/ssh/moduli ]]; then
-    local weak; weak="$(awk '$1 !~ /^#/ && $5 < 3071' /etc/ssh/moduli 2>/dev/null | wc -l)"
+    weak="$(awk '$1 !~ /^#/ && $5 < 3071' /etc/ssh/moduli 2>/dev/null | wc -l)"
     if [[ "${weak:-0}" -eq 0 ]]; then sv_check pass ssh moduli "all DH moduli are 3072 bits or more"
     else sv_check fail ssh moduli "$weak DH moduli under 3072 bits"; fi
   fi
@@ -1600,10 +1655,16 @@ ssh_scan() {
 }
 
 # ==========================================================================
-# firewall - packet filtering
+# firewall - default-deny inbound with only the ports you asked for
 # ==========================================================================
+#
+# Deny inbound, allow outbound, SSH rate-limited. 80 and 443 are not opened
+# unless you ask, because plenty of servers are not web servers and an open
+# port should be something somebody typed.
+#
+# Whatever sshd listens on now and whatever it is about to listen on are both
+# kept open, so changing the SSH port in the same run cannot strand you.
 
-firewall_desc() { printf 'default-deny inbound with only the ports you asked for'; }
 
 firewall_backend() {
   local want; want="$(sv_get firewall.backend)"
@@ -1780,25 +1841,18 @@ firewall_scan() {
     ufw)
       if ! sv_has_cmd ufw; then sv_check fail firewall installed "ufw not installed"; return 0; fi
       sv_check pass firewall installed "ufw installed"
-      if ufw status 2>/dev/null | head -1 | grep -q 'active'; then
-        sv_check pass firewall active "ufw is active"
-      else
-        sv_check fail firewall active "ufw is installed but not active"
-      fi
-      if ufw status verbose 2>/dev/null | grep -q 'Default: deny (incoming)'; then
-        sv_check pass firewall default-deny "default incoming policy is deny"
-      else
-        sv_check fail firewall default-deny "default incoming policy is not deny"
-      fi
+      sv_verdict firewall active "ufw is active" "ufw is installed but not active" \
+        sv_grep_cmd 'Status: active' ufw status
+      sv_verdict firewall default-deny \
+        "default incoming policy is deny" "default incoming policy is not deny" \
+        sv_grep_cmd 'Default: deny (incoming)' ufw status verbose
       ;;
     nftables)
       if ! sv_has_cmd nft; then sv_check fail firewall installed "nft not installed"; return 0; fi
       sv_check pass firewall installed "nftables installed"
-      if nft list chain inet filter input 2>/dev/null | grep -q 'policy drop'; then
-        sv_check pass firewall default-deny "input policy is drop"
-      else
-        sv_check fail firewall default-deny "input chain is not default-drop"
-      fi
+      sv_verdict firewall default-deny \
+        "input policy is drop" "input chain is not default-drop" \
+        sv_grep_cmd 'policy drop' nft list chain inet filter input
       ;;
   esac
 
@@ -1818,20 +1872,18 @@ firewall_scan() {
 }
 
 # ==========================================================================
-# docker - container host hardening
+# docker - stop published container ports bypassing the firewall
 # ==========================================================================
 #
-# Docker inserts its own rules into the nat and filter tables and they are
-# evaluated before ufw's. "docker run -p 5432:5432" is reachable from the
-# internet even with "ufw deny 5432" in place, which is the single most
-# common false sense of security on a container host.
+# Docker writes its own iptables rules and they are evaluated before ufw's.
+# 'docker run -p 5432:5432' answers the internet with 'ufw deny 5432' in
+# place and ufw status showing the rule. A great many people believe their
+# database is firewalled when it is not.
 #
-# The DOCKER-USER chain is the one place Docker promises not to touch, and it
-# is consulted before the rules that accept published ports. Putting a default
-# drop there, with explicit allowances, is what ufw-docker does and what this
-# module does directly.
+# DOCKER-USER is consulted before Docker's own accept rules and Docker never
+# rewrites it, so a default DROP there actually holds. Restarting the daemon
+# flushes the chain, hence the unit that puts the rules back.
 
-docker_desc() { printf 'stop published container ports bypassing the firewall'; }
 
 readonly SV_DOCKER_SCRIPT="/usr/local/sbin/securevps-docker-firewall"
 readonly SV_DOCKER_UNIT="/etc/systemd/system/securevps-docker-firewall.service"
@@ -1860,11 +1912,10 @@ docker_allow_cidrs_v6() {
 # securevps.sh happens to be sitting when it is run.
 docker_render_script() {
   local published; published="$(firewall_parse_allow "$(sv_get docker.allow-published)")"
-  local c p
 
   cat <<'EOF'
 #!/bin/sh
-# Managed by securevps.sh. Regenerated on every run of the docker module.
+# Managed by securevps.sh. Regenerated on every run of the docker step.
 #
 # Docker inserts its own rules ahead of ufw's, so "ufw deny 5432" does not
 # stop "docker run -p 5432:5432" from answering the internet. DOCKER-USER is
@@ -1876,33 +1927,26 @@ docker_render_script() {
 set -u
 EOF
 
-  printf '\nv4() {\n'
-  printf '  iptables -N DOCKER-USER 2>/dev/null || true\n'
-  printf '  iptables -F DOCKER-USER\n'
-  printf '  iptables -A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN\n'
-  printf '  iptables -A DOCKER-USER -i lo -j RETURN\n'
-  for c in $(docker_allow_cidrs_v4); do
-    printf '  iptables -A DOCKER-USER -s %s -j RETURN\n' "$c"
+  local family ipt cidrs c p
+  for family in 4 6; do
+    if [[ "$family" == 4 ]]; then
+      ipt=iptables; cidrs="$(docker_allow_cidrs_v4)"
+    else
+      ipt=ip6tables; cidrs="$(docker_allow_cidrs_v6)"
+    fi
+    printf '\nv%s() {\n' "$family"
+    printf '  %s -N DOCKER-USER 2>/dev/null || true\n' "$ipt"
+    printf '  %s -F DOCKER-USER\n' "$ipt"
+    printf '  %s -A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN\n' "$ipt"
+    printf '  %s -A DOCKER-USER -i lo -j RETURN\n' "$ipt"
+    for c in $cidrs; do
+      printf '  %s -A DOCKER-USER -s %s -j RETURN\n' "$ipt" "$c"
+    done
+    for p in $published; do
+      printf '  %s -A DOCKER-USER -p %s --dport %s -j RETURN\n' "$ipt" "${p##*/}" "${p%%/*}"
+    done
+    printf '  %s -A DOCKER-USER -j DROP\n}\n' "$ipt"
   done
-  for p in $published; do
-    printf '  iptables -A DOCKER-USER -p %s --dport %s -j RETURN\n' "${p##*/}" "${p%%/*}"
-  done
-  printf '  iptables -A DOCKER-USER -j DROP\n'
-  printf '}\n'
-
-  printf '\nv6() {\n'
-  printf '  ip6tables -N DOCKER-USER 2>/dev/null || true\n'
-  printf '  ip6tables -F DOCKER-USER\n'
-  printf '  ip6tables -A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN\n'
-  printf '  ip6tables -A DOCKER-USER -i lo -j RETURN\n'
-  for c in $(docker_allow_cidrs_v6); do
-    printf '  ip6tables -A DOCKER-USER -s %s -j RETURN\n' "$c"
-  done
-  for p in $published; do
-    printf '  ip6tables -A DOCKER-USER -p %s --dport %s -j RETURN\n' "${p##*/}" "${p%%/*}"
-  done
-  printf '  ip6tables -A DOCKER-USER -j DROP\n'
-  printf '}\n'
 
   cat <<'EOF'
 
@@ -2073,17 +2117,15 @@ docker_scan() {
     return 0
   fi
 
-  if sv_has_cmd iptables && iptables -S DOCKER-USER 2>/dev/null | grep -q -- '-j DROP'; then
-    sv_check pass docker firewall-bypass "DOCKER-USER ends in DROP, published ports are filtered"
-  else
-    sv_check fail docker firewall-bypass "DOCKER-USER has no default drop, published container ports bypass the firewall"
-  fi
+  sv_verdict docker firewall-bypass \
+    "DOCKER-USER ends in DROP, published ports are filtered" \
+    "DOCKER-USER has no default drop, published container ports bypass the firewall" \
+    sv_grep_cmd '-j DROP' iptables -S DOCKER-USER
 
-  if sv_unit_enabled securevps-docker-firewall.service; then
-    sv_check pass docker rules-persist "the DOCKER-USER rules are reapplied after a docker restart"
-  else
-    sv_check fail docker rules-persist "nothing reapplies the DOCKER-USER rules after a docker restart"
-  fi
+  sv_verdict docker rules-persist \
+    "the DOCKER-USER rules are reapplied after a docker restart" \
+    "nothing reapplies the DOCKER-USER rules after a docker restart" \
+    sv_unit_enabled securevps-docker-firewall.service
 
   if [[ -f /etc/docker/daemon.json ]]; then
     local j; j="$(cat /etc/docker/daemon.json)"
@@ -2124,10 +2166,15 @@ docker_scan() {
 }
 
 # ==========================================================================
-# bruteforce - fail2ban or CrowdSec
+# bruteforce - ban addresses that keep failing to log in
 # ==========================================================================
+#
+# With key-only auth already in place this mostly saves log volume rather
+# than stopping a real attack, but log volume is worth saving.
+#
+# The address you are connected from goes on the never-ban list. Fail2ban
+# banning the administrator mid-setup is a rite of passage nobody needs.
 
-bruteforce_desc() { printf 'ban addresses that keep failing to log in'; }
 
 bruteforce_ignore_list() {
   local list="127.0.0.1/8 ::1"
@@ -2244,11 +2291,8 @@ bruteforce_scan() {
   fi
 
   if [[ "$engine" == crowdsec ]]; then
-    if sv_unit_active crowdsec.service; then
-      sv_check pass bruteforce running "CrowdSec is running"
-    else
-      sv_check fail bruteforce running "CrowdSec is not running"
-    fi
+    sv_verdict bruteforce running "CrowdSec is running" "CrowdSec is not running" \
+      sv_unit_active crowdsec.service
     return 0
   fi
 
@@ -2285,10 +2329,16 @@ bruteforce_scan() {
 }
 
 # ==========================================================================
-# sysctl - kernel and network parameters
+# sysctl - kernel and network stack hardening
 # ==========================================================================
+#
+# Reverse-path filtering, no source routing, no ICMP redirects, SYN cookies,
+# martian logging, and kernel restrictions that turn a local information leak
+# into a dead end.
+#
+# ip_forward and unprivileged user namespaces are left alone when Docker is
+# installed, because turning either off breaks container networking.
 
-sysctl_desc() { printf 'kernel and network stack hardening'; }
 
 sysctl_ip_forward() {
   case "$(sv_get sysctl.ip-forward)" in
@@ -2456,10 +2506,13 @@ sysctl_scan() {
 }
 
 # ==========================================================================
-# kmodules - kernel module blacklist
+# kmodules - blacklist filesystems and protocols a VPS never uses
 # ==========================================================================
+#
+# Drivers for filesystems and network protocols no server touches are still
+# attack surface. squashfs is deliberately absent from the list, because
+# snap packages will not mount without it.
 
-kmodules_desc() { printf 'blacklist filesystems and protocols a VPS never uses'; }
 
 kmodules_list() {
   local out=""
@@ -2541,10 +2594,15 @@ kmodules_scan() {
 }
 
 # ==========================================================================
-# mounts - filesystem mount options
+# mounts - nodev, nosuid and noexec on the writable scratch directories
 # ==========================================================================
+#
+# /dev/shm is the one that is pure win: nothing legitimate executes or makes
+# device nodes there, and it is a favourite staging area for exploits.
+#
+# /tmp and /var/tmp are opt-in. Package installers, language toolchains and
+# container image builds all extract to them and run what they extracted.
 
-mounts_desc() { printf 'nodev, nosuid and noexec on the writable scratch directories'; }
 
 mounts_unit() {
   local where="$1" opts="$2" name
@@ -2643,7 +2701,14 @@ mounts_scan() {
     return 0
   fi
   local target opts
-  for target in /dev/shm /tmp /var/tmp; do
+  for target in /dev/shm /var/tmp /tmp; do
+    # Only report on the ones this host asked for; /tmp and /var/tmp are
+    # opt-in because installers and image builds run scripts out of them.
+    case "$target" in
+      /dev/shm) sv_bool mounts.dev-shm || { sv_check skip mounts devshm "/dev/shm hardening not requested"; continue; } ;;
+      /var/tmp) sv_bool mounts.var-tmp || { sv_check skip mounts vartmp "/var/tmp hardening not requested"; continue; } ;;
+      /tmp)     sv_bool mounts.tmp     || { sv_check skip mounts tmp "/tmp hardening not requested"; continue; } ;;
+    esac
     opts="$(findmnt -no OPTIONS --target "$target" 2>/dev/null || true)"
     if [[ -z "$opts" ]]; then
       sv_check skip mounts "${target//\//}" "$target is not a separate mount"
@@ -2664,10 +2729,12 @@ mounts_scan() {
 }
 
 # ==========================================================================
-# pam - passwords and login policy
+# pam - password quality, lockout after repeated failures, ageing
 # ==========================================================================
+#
+# Matters even with key-only SSH: sudo, console login and any service using
+# PAM still take passwords.
 
-pam_desc() { printf 'password quality, lockout after repeated failures, ageing'; }
 
 pam_apply() {
   sv_header "pam"
@@ -2772,18 +2839,12 @@ pam_scan() {
     sv_check fail pam pwquality "minimum password length is ${minlen:-unset}, wanted $(sv_int pam.min-length)"
   fi
 
-  if grep -rqs 'pam_faillock' /etc/pam.d/ 2>/dev/null; then
-    sv_check pass pam faillock "faillock is wired into PAM"
-  else
-    sv_check fail pam faillock "no lockout after repeated authentication failures"
-  fi
+  sv_verdict pam faillock \
+    "faillock is wired into PAM" "no lockout after repeated authentication failures" \
+    grep -rqs pam_faillock /etc/pam.d/
 
   local enc; enc="$(awk '/^ENCRYPT_METHOD/{print $2}' /etc/login.defs 2>/dev/null || true)"
-  if [[ "${enc^^}" == "YESCRYPT" || "${enc^^}" == "SHA512" ]]; then
-    sv_check pass pam hashing "password hashing is $enc"
-  else
-    sv_check fail pam hashing "password hashing is ${enc:-unset}"
-  fi
+  sv_expect pam hashing "password hashing" "${enc^^}" YESCRYPT SHA512
 
   local maxdays; maxdays="$(awk '/^PASS_MAX_DAYS/{print $2}' /etc/login.defs 2>/dev/null || true)"
   if [[ -n "$maxdays" && "$maxdays" -le "$(sv_int pam.pass-max-days)" ]]; then
@@ -2794,10 +2855,13 @@ pam_scan() {
 }
 
 # ==========================================================================
-# services - reduce what is listening
+# services - stop and disable services a VPS rarely needs
 # ==========================================================================
+#
+# Reports what is listening before touching anything, then stops the ones a
+# server has no use for. Packages are disabled rather than removed unless
+# --services-purge says otherwise.
 
-services_desc() { printf 'stop and disable services a VPS rarely needs'; }
 
 readonly SV_SERVICES_DEFAULT="rpcbind avahi-daemon cups cups-browsed nfs-server \
 inetd xinetd telnet vsftpd smbd nmbd snmpd rsh-server talk ldap slapd bind9"
@@ -2879,10 +2943,12 @@ services_scan() {
 }
 
 # ==========================================================================
-# time - clock synchronisation
+# time - a correct clock, which TLS and log correlation depend on
 # ==========================================================================
+#
+# Certificate validation and any attempt to line up two logs both fall apart
+# on a drifting clock.
 
-time_desc() { printf 'a correct clock, which TLS and log correlation depend on'; }
 
 time_apply() {
   sv_header "time"
@@ -2940,10 +3006,13 @@ time_scan() {
 }
 
 # ==========================================================================
-# logging - journald and auditd
+# logging - logs that survive a reboot and an audit trail
 # ==========================================================================
+#
+# Without a persistent journal the logs live in /run and are gone after a
+# reboot, which is exactly when you want to read them. The audit ruleset
+# stays light by default; the CIS set is verbose enough to fill a small disk.
 
-logging_desc() { printf 'logs that survive a reboot and an audit trail'; }
 
 logging_audit_rules_light() {
   cat <<'EOF'
@@ -3073,11 +3142,9 @@ EOF
 }
 
 logging_scan() {
-  if [[ -d /var/log/journal ]]; then
-    sv_check pass logging persistent "the journal survives a reboot"
-  else
-    sv_check fail logging persistent "the journal is in /run and is lost on reboot"
-  fi
+  sv_verdict logging persistent \
+    "the journal survives a reboot" "the journal is in /run and is lost on reboot" \
+    test -d /var/log/journal
 
   if [[ $SV_IS_CONTAINER -eq 1 ]]; then
     sv_check skip logging auditd "auditd needs a host kernel"
@@ -3097,10 +3164,12 @@ logging_scan() {
 }
 
 # ==========================================================================
-# apparmor - mandatory access control
+# apparmor - AppArmor profiles in enforce rather than complain mode
 # ==========================================================================
+#
+# A profile in complain mode logs what it would have blocked and blocks
+# nothing, which is worth roughly nothing on its own.
 
-apparmor_desc() { printf 'AppArmor profiles in enforce rather than complain mode'; }
 
 apparmor_apply() {
   sv_header "apparmor"
@@ -3163,10 +3232,12 @@ apparmor_scan() {
 }
 
 # ==========================================================================
-# banner - login banners
+# banner - a legal warning banner, and no OS version before login
 # ==========================================================================
+#
+# The stock /etc/issue.net prints the distribution and kernel version to
+# anyone who opens a connection, which is free reconnaissance.
 
-banner_desc() { printf 'a legal warning banner, and no OS version before login'; }
 
 banner_text() {
   local f; f="$(sv_get banner.file)"
@@ -3213,16 +3284,12 @@ banner_apply() {
 }
 
 banner_scan() {
-  if [[ -f /etc/issue.net ]] && grep -qi 'authorised\|authorized' /etc/issue.net 2>/dev/null; then
-    sv_check pass banner issue-net "a warning banner is shown before login"
-  else
-    sv_check fail banner issue-net "no warning banner before login"
-  fi
-  if [[ -f /etc/issue.net ]] && grep -qE '\\[a-zA-Z]' /etc/issue.net 2>/dev/null; then
-    sv_check fail banner os-disclosure "/etc/issue.net still expands the OS version"
-  else
-    sv_check pass banner os-disclosure "no OS version disclosed before login"
-  fi
+  sv_verdict banner issue-net \
+    "a warning banner is shown before login" "no warning banner before login" \
+    grep -qsi 'authorised\|authorized' /etc/issue.net
+  sv_verdict banner os-disclosure \
+    "no OS version disclosed before login" "/etc/issue.net still expands the OS version" \
+    sv_not grep -qsE '\\[a-zA-Z]' /etc/issue.net
   local v; v="$(sv_sshd_get debianbanner 2>/dev/null || true)"
   if [[ "$v" == "no" ]]; then
     sv_check pass banner sshd-version "sshd does not advertise the distribution patch level"
@@ -3232,10 +3299,14 @@ banner_scan() {
 }
 
 # ==========================================================================
-# integrity - file integrity monitoring
+# integrity - AIDE, so you can tell what changed on disk (off by default)
 # ==========================================================================
+#
+# Off by default because the first run takes minutes and the daily mail is
+# noise unless somebody reads it. Worth knowing: the database sits on the
+# same host it is checking, so copy it somewhere else or an attacker with
+# root rewrites both.
 
-integrity_desc() { printf 'AIDE, so you can tell what changed on disk (off by default)'; }
 
 integrity_apply() {
   sv_header "integrity"
@@ -3273,19 +3344,8 @@ IOSchedulingClass=idle
 ExecStart=/usr/bin/aide --check --config /etc/aide/aide.conf
 EOF
 
-  sv_write_file integrity /etc/systemd/system/securevps-aide.timer 0644 <<EOF
-$(sv_managed_header)
-[Unit]
-Description=securevps.sh AIDE integrity check
-
-[Timer]
-OnCalendar=$(sv_get integrity.schedule)
-RandomizedDelaySec=1h
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
+  sv_timer_unit integrity securevps-aide \
+    "securevps.sh AIDE integrity check" "$(sv_get integrity.schedule)"
 
   if sv_dry; then
     sv_would "build the AIDE database, which takes several minutes"
@@ -3316,23 +3376,20 @@ integrity_scan() {
     sv_check skip integrity aide "file integrity monitoring not requested"
     return 0
   fi
-  if [[ -f /var/lib/aide/aide.db ]]; then
-    sv_check pass integrity aide "AIDE database present"
-  else
-    sv_check fail integrity aide "AIDE has no baseline database"
-  fi
-  if sv_unit_enabled securevps-aide.timer; then
-    sv_check pass integrity schedule "integrity checks are scheduled"
-  else
-    sv_check fail integrity schedule "integrity checks are not scheduled"
-  fi
+  sv_verdict integrity aide "AIDE database present" "AIDE has no baseline database" \
+    test -f /var/lib/aide/aide.db
+  sv_verdict integrity schedule \
+    "integrity checks are scheduled" "integrity checks are not scheduled" \
+    sv_unit_enabled securevps-aide.timer
 }
 
 # ==========================================================================
-# mfa - TOTP as a second factor for SSH
+# mfa - a TOTP code on top of the SSH key (off by default)
 # ==========================================================================
+#
+# Required in addition to the key, never instead of it. Name a deploy
+# account with --mfa-exempt-user so automation keeps working.
 
-mfa_desc() { printf 'a TOTP code on top of the SSH key (off by default)'; }
 
 mfa_render_sshd() {
   local exempt; exempt="$(sv_get mfa.exempt-user)"
@@ -3394,11 +3451,9 @@ mfa_scan() {
     sv_check skip mfa totp "second factor not requested"
     return 0
   fi
-  if grep -rqs 'pam_google_authenticator' /etc/pam.d/ 2>/dev/null; then
-    sv_check pass mfa totp "TOTP is wired into the SSH PAM stack"
-  else
-    sv_check fail mfa totp "TOTP is not wired into PAM"
-  fi
+  sv_verdict mfa totp \
+    "TOTP is wired into the SSH PAM stack" "TOTP is not wired into PAM" \
+    grep -rqs pam_google_authenticator /etc/pam.d/
   if [[ "$(sv_sshd_get authenticationmethods)" == *keyboard-interactive* ]]; then
     sv_check pass mfa sshd "sshd asks for a second factor"
   else
@@ -3407,10 +3462,13 @@ mfa_scan() {
 }
 
 # ==========================================================================
-# vpn - private admin access
+# vpn - WireGuard or Tailscale, so SSH need not face the internet
 # ==========================================================================
+#
+# The strongest single change available: a port that never appears in a
+# public scan does not get brute forced. Keep a provider console session
+# available, because the VPN becomes a dependency of your access.
 
-vpn_desc() { printf 'WireGuard or Tailscale, so SSH need not face the internet'; }
 
 vpn_apply() {
   sv_header "vpn"
@@ -3527,10 +3585,12 @@ vpn_scan() {
 }
 
 # ==========================================================================
-# alerts - notification on access
+# alerts - tell someone when a person logs in (off by default)
 # ==========================================================================
+#
+# A PAM hook on every interactive session. Cheap, and the first thing that
+# tells you a key has been copied.
 
-alerts_desc() { printf 'tell someone when a person logs in (off by default)'; }
 
 alerts_apply() {
   sv_header "alerts"
@@ -3580,18 +3640,18 @@ alerts_scan() {
     sv_check skip alerts login "login alerts not requested"
     return 0
   fi
-  if grep -qs 'securevps-login-alert' /etc/pam.d/sshd 2>/dev/null; then
-    sv_check pass alerts login "login alerts are wired into PAM"
-  else
-    sv_check fail alerts login "login alerts are not wired into PAM"
-  fi
+  sv_verdict alerts login \
+    "login alerts are wired into PAM" "login alerts are not wired into PAM" \
+    grep -qs securevps-login-alert /etc/pam.d/sshd
 }
 
 # ==========================================================================
-# backup - restic scaffolding
+# backup - restic and a timer, pointed at a repository you supply
 # ==========================================================================
+#
+# Will not invent a destination. A backup you have never restored is a
+# hypothesis, so run a restore into /tmp once and look at what comes back.
 
-backup_desc() { printf 'restic and a timer, pointed at a repository you supply'; }
 
 backup_apply() {
   sv_header "backup"
@@ -3633,16 +3693,8 @@ ExecStart=/usr/bin/restic backup --one-file-system --exclude-caches /etc /home /
 ExecStartPost=/usr/bin/restic forget --prune --keep-daily 7 --keep-weekly 4 --keep-monthly 6
 EOF
 
-  sv_write_file backup /etc/systemd/system/securevps-backup.timer 0644 <<EOF
-$(sv_managed_header)
-[Timer]
-OnCalendar=$(sv_get backup.schedule)
-RandomizedDelaySec=1h
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
+  sv_timer_unit backup securevps-backup \
+    "securevps.sh restic backup" "$(sv_get backup.schedule)"
 
   if ! sv_dry; then
     systemctl daemon-reload >/dev/null 2>&1 || true
@@ -3658,20 +3710,16 @@ backup_scan() {
     sv_check skip backup timer "backups not configured here"
     return 0
   fi
-  if sv_unit_enabled securevps-backup.timer; then
-    sv_check pass backup timer "backup timer is enabled"
-  else
-    sv_check fail backup timer "backup timer is not enabled"
-  fi
-  if sv_has_cmd restic && [[ -f /etc/securevps/backup.env ]]; then
-    sv_check pass backup configured "restic is installed and configured"
-  else
-    sv_check fail backup configured "restic is not configured"
-  fi
+  sv_verdict backup timer "backup timer is enabled" "backup timer is not enabled" \
+    sv_unit_enabled securevps-backup.timer
+  sv_verdict backup configured \
+    "restic is installed and configured" "restic is not configured" \
+    test -f /etc/securevps/backup.env
 }
 
+
 # --------------------------------------------------------------------------
-# 8. argument parsing
+# 9. argument parsing
 # --------------------------------------------------------------------------
 
 sv_is_module() {
@@ -3704,30 +3752,6 @@ sv_flag_to_key() {
   [[ $hits -eq 1 ]] && { printf '%s' "$candidate"; return 0; }
   printf ''
   return 1
-}
-
-sv_load_config() {
-  local file; file="$(sv_get core.config)"
-  [[ -z "$file" ]] && file="$SV_DEFAULT_CONFIG"
-  [[ -r "$file" ]] || return 0
-  sv_debug "reading $file"
-  local line key value
-  while IFS= read -r line; do
-    line="${line%%#*}"
-    line="${line#"${line%%[![:space:]]*}"}"
-    line="${line%"${line##*[![:space:]]}"}"
-    [[ -z "$line" ]] && continue
-    [[ "$line" != *=* ]] && { sv_warn "$file: cannot parse '$line'"; continue; }
-    key="${line%%=*}"; value="${line#*=}"
-    key="${key%"${key##*[![:space:]]}"}"
-    value="${value#"${value%%[![:space:]]*}"}"
-    value="${value%\"}"; value="${value#\"}"
-    if [[ -z "${OPT_TYPE[$key]-}" ]]; then
-      sv_warn "$file: unknown setting '$key'"
-      continue
-    fi
-    sv_set "$key" "$value"
-  done < "$file"
 }
 
 sv_is_command() {
@@ -3828,16 +3852,16 @@ sv_parse_args() {
   return 0
 }
 
+
 # --------------------------------------------------------------------------
-# 10. commands and dispatch
+# 10. dispatch
 # --------------------------------------------------------------------------
 
 sv_profile_modules() {
   case "$(sv_get core.profile)" in
     minimal) printf '%s\n' "${SV_PROFILE_MINIMAL[@]}" ;;
     standard) printf '%s\n' "${SV_PROFILE_STANDARD[@]}" ;;
-    paranoid) printf '%s\n' "${SV_PROFILE_PARANOID[@]}" ;;
-    *) sv_die "unknown profile: $(sv_get core.profile). Pick minimal, standard or paranoid." ;;
+    *) sv_die "unknown profile: $(sv_get core.profile). Pick minimal or standard." ;;
   esac
 }
 
@@ -3863,28 +3887,6 @@ sv_resolve_modules() {
       continue
     fi
     SV_RUN_MODULES+=("$m")
-  done
-}
-
-sv_paranoid_overrides() {
-  [[ "$(sv_get core.profile)" == paranoid ]] || return 0
-  sv_debug "applying paranoid overrides"
-  # These are the settings the profile exists to change. A flag given on the
-  # command line has already been applied, so only touch untouched defaults.
-  local -a pairs=(
-    mounts.noexec-tmp:true
-    integrity.enable:true
-    logging.audit-rules:cis
-    sysctl.ptrace-scope:2
-    kmodules.usb-storage:true
-    bruteforce.aggressive:true
-    pam.tmout:900
-  )
-  local p key value
-  for p in "${pairs[@]}"; do
-    key="${p%%:*}"; value="${p##*:}"
-    [[ "${SV_EXPLICIT[$key]-}" == 1 ]] && continue
-    sv_set "$key" "$value"
   done
 }
 
@@ -4075,19 +4077,19 @@ ${C_BOLD}USAGE${C_RESET}
   securevps.sh [command] [options]
 
 ${C_BOLD}COMMANDS${C_RESET}
-  harden              run every module in the active profile (default)
+  harden              run every step in the active profile (default)
   scan                report what is and is not applied, exit 1 on any failure
-  revert [module...]  put back every file securevps.sh changed
+  revert [step...]    put back every file securevps.sh changed
   confirm             cancel the armed sshd rollback after testing a new session
   help                this text
 
-  <module>            run one module on its own, e.g. securevps.sh ssh
+${C_BOLD}HARDENING STEPS${C_RESET}
+  Each one is also a command: securevps.sh ssh --port 2222
 
-${C_BOLD}MODULES${C_RESET}
 EOF
   local m
   for m in "${SV_MODULE_ORDER[@]}"; do
-    printf '  %-12s %s\n' "$m" "$("${m}_desc")"
+    printf '  %-12s %s\n' "$m" "${MODULE_DESC[$m]}"
   done
 
   cat <<EOF
@@ -4095,9 +4097,11 @@ EOF
 ${C_BOLD}PROFILES${C_RESET}
   minimal    ${SV_PROFILE_MINIMAL[*]}
              nothing here can break a running application.
-  standard   the default. Adds accounts, Docker, PAM, logging and the rest.
-  paranoid   standard plus noexec /tmp, AIDE, the CIS audit ruleset and
-             stricter kernel settings. Expect to have to loosen something.
+  standard   the default, everything above plus accounts, Docker, PAM,
+             logging, mount options and the rest.
+
+  Anything outside the profile is one command away, so there is no third
+  profile: securevps.sh integrity --enable, securevps.sh mfa --enable.
 
 ${C_BOLD}COMMON OPTIONS${C_RESET}
   -n, --dry-run       show a diff of every change, write nothing
@@ -4105,15 +4109,14 @@ ${C_BOLD}COMMON OPTIONS${C_RESET}
   -v, --verbose       explain each decision
   -q, --quiet         errors only
       --json          machine-readable output, mainly for scan
-      --profile P     minimal, standard or paranoid
-      --only a,b      run just these modules
+      --profile P     minimal or standard
+      --only a,b      run just these steps
       --skip a,b      run everything except these
-      --config FILE   read settings from FILE (default $SV_DEFAULT_CONFIG)
       --run ID        revert only this run instead of all of them
 
-${C_BOLD}MODULE OPTIONS${C_RESET}
-  Every setting below is a flag. Inside a single-module run the module prefix
-  is optional, so these are the same thing:
+${C_BOLD}STEP OPTIONS${C_RESET}
+  Every setting below is a flag. Inside a single-step run the prefix is
+  optional, so these are the same thing:
 
       securevps.sh harden --ssh-port 2222
       securevps.sh ssh --port 2222
@@ -4144,19 +4147,9 @@ ${C_BOLD}EXAMPLES${C_RESET}
   securevps.sh scan --json | jq .summary
   securevps.sh revert ssh                undo only the sshd changes
 
-${C_BOLD}CONFIG FILE${C_RESET}
-  $SV_DEFAULT_CONFIG, one "key = value" per line, using the names above:
-
-      ssh.port = 2222
-      ssh.tcp-forwarding = true
-      firewall.allow = 80,443
-      user.name = admin
-
 Full documentation: https://github.com/MilzInformatik/securevps.sh
 EOF
 }
-
-SV_REVERT_RUN=""
 
 sv_main() {
   # --run is revert-only and has no CFG entry.
@@ -4169,17 +4162,6 @@ sv_main() {
     esac
   done
 
-  # The config file is read first so command line flags win, but --config
-  # itself has to be found before that happens.
-  local i
-  for ((i = 0; i < ${#args[@]}; i++)); do
-    [[ "${args[$i]}" == "--config" ]] && CFG[core.config]="${args[$((i + 1))]-}"
-    [[ "${args[$i]}" == --config=* ]] && CFG[core.config]="${args[$i]#*=}"
-  done
-
-  # Settings that came from the config file count as explicit too: the
-  # paranoid profile must not override what the operator wrote down.
-  sv_load_config
   sv_parse_args ${args[@]+"${args[@]}"}
 
   case "$SV_CMD" in
@@ -4187,7 +4169,6 @@ sv_main() {
   esac
 
   sv_detect_system
-  sv_paranoid_overrides
 
   case "$SV_CMD" in
     harden) sv_cmd_harden ;;

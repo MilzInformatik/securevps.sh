@@ -29,7 +29,7 @@ securevps.sh docker --no-icc
 |---|---|
 | `--dry-run` | print every change as a diff, touch nothing |
 | `--yes` | no prompts, for cloud-init and CI |
-| `--profile minimal\|standard` | which steps `harden` runs |
+| `--profile core\|minimal\|standard` | which steps `harden` runs |
 | `--only <a,b>` / `--skip <a,b>` | module selection for `harden` |
 | `--no-backup` | skip config backups, off by default |
 | `--force` | carry on past the lockout guards |
@@ -42,20 +42,26 @@ undoes just that module's files.
 
 ## Profiles
 
-`minimal` is the set I would run on any box without thinking: updates, ssh,
-firewall, bruteforce, sysctl, time, banner. Nothing in it can break an
-application.
+`core` is the default: updates, user, firewall, ssh, docker, bruteforce. These
+are the six steps every internet-facing VPS needs, and the six whose effects a
+reader can hold in their head. When one of them breaks something, the cause
+is obvious: a closed port, a key-only sshd, a Docker chain rule.
 
-`standard` is the default. It adds user, docker when Docker is present, pam,
-services, logging, kmodules, apparmor, banner and mount options.
+`minimal` is core without the two steps that touch accounts and Docker, plus
+sysctl, time and banner. Nothing in it can break an application.
 
-There is no third profile. An earlier draft had `paranoid`, and most of what it
+`standard` is core plus sysctl, kmodules, pam, services, time, logging,
+apparmor, banner and mounts. Each of those is worth having, and each is the
+kind of change that is hard to trace back when it does bite (a PAM lockout, a
+blacklisted module, an AppArmor denial). So they are opt-in, one command
+away, and the README describes each in a paragraph rather than a page.
+
+There is no `paranoid` profile. An earlier draft had one, and most of what it
 turned on was either actively harmful on a container host (noexec `/tmp`, no
 container-to-container traffic), noisy enough to fill a small disk (the CIS
-audit ruleset), or meaningless on a VPS (blacklisting usb-storage). The parts
-worth keeping went into the defaults instead: mount hardening on `/dev/shm`,
-and aggressive fail2ban matching. Everything else it did is still one flag
-away, which is the better place for a setting that breaks things.
+audit ruleset), or meaningless on a VPS (blacklisting usb-storage, which is
+why that flag and the firewire one are gone). Everything else it did is still
+one flag away, which is the better place for a setting that breaks things.
 
 ## Behaviour rules
 

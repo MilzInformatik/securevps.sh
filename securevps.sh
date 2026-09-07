@@ -56,6 +56,7 @@ readonly SV_PROFILE_PARANOID=(
 
 # Runtime state.
 SV_CMD=""                 # harden | scan | revert | confirm | <module> | help
+SV_CMD_GIVEN=0            # whether the command was typed or defaulted
 SV_ACTIVE_MODULE=""       # set when a single module runs, enables short flags
 SV_RUN_ID=""
 SV_BACKUP_DIR=""
@@ -3729,16 +3730,32 @@ sv_load_config() {
   done < "$file"
 }
 
+sv_is_command() {
+  case "$1" in
+    harden|scan|revert|confirm|help) return 0 ;;
+  esac
+  sv_is_module "$1"
+}
+
+sv_take_command() {
+  SV_CMD="$1"
+  SV_CMD_GIVEN=1
+  sv_is_module "$SV_CMD" && SV_ACTIVE_MODULE="$SV_CMD"
+  return 0
+}
+
 sv_parse_args() {
   local -a rest=()
   local arg key next
+  SV_CMD="harden"
+  SV_CMD_GIVEN=0
 
-  # The command comes first, unless it is a flag or missing entirely.
+  # The command usually comes first, but "securevps.sh --profile minimal
+  # harden" is a reasonable thing to type, so a bare word anywhere in the
+  # arguments is accepted as the command until one has been seen.
   if [[ $# -gt 0 && "$1" != -* ]]; then
-    SV_CMD="$1"; shift
-    sv_is_module "$SV_CMD" && SV_ACTIVE_MODULE="$SV_CMD"
-  else
-    SV_CMD="harden"
+    sv_is_command "$1" || sv_die "unknown command: $1. Try: securevps.sh help"
+    sv_take_command "$1"; shift
   fi
 
   # revert takes bare module names.
@@ -3759,6 +3776,13 @@ sv_parse_args() {
     esac
 
     if [[ "$arg" != --* ]]; then
+      if [[ $SV_CMD_GIVEN -eq 0 ]] && sv_is_command "$arg"; then
+        sv_take_command "$arg"; shift
+        if [[ "$SV_CMD" == "revert" ]]; then
+          while [[ $# -gt 0 && "$1" != -* ]]; do SV_REVERT_TARGETS+=("$1"); shift; done
+        fi
+        continue
+      fi
       rest+=("$arg"); shift; continue
     fi
 
@@ -3795,7 +3819,12 @@ sv_parse_args() {
     fi
   done
 
-  [[ ${#rest[@]} -gt 0 ]] && sv_die "unexpected argument: ${rest[0]}"
+  if [[ ${#rest[@]} -gt 0 ]]; then
+    if sv_is_command "${rest[0]}"; then
+      sv_die "two commands given: $SV_CMD and ${rest[0]}"
+    fi
+    sv_die "unexpected argument: ${rest[0]}. Try: securevps.sh help"
+  fi
   return 0
 }
 
@@ -3999,9 +4028,14 @@ sv_cmd_revert() {
   else
     # Newest first, so the oldest backup is written last and the file ends up
     # as it was before securevps.sh ever touched it.
-    local found
-    found="$(find "$SV_BACKUP_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort -r)"
-    [[ -n "$found" ]] || sv_die "nothing to revert, $SV_BACKUP_ROOT is empty"
+    # find exits non-zero when the directory does not exist, and pipefail
+    # then carries that out of the assignment and set -e kills the run before
+    # the message below is ever printed.
+    local found=""
+    if [[ -d "$SV_BACKUP_ROOT" ]]; then
+      found="$(find "$SV_BACKUP_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort -r || true)"
+    fi
+    [[ -n "$found" ]] || sv_die "nothing to revert, securevps.sh has not changed anything on this host"
     mapfile -t runs <<< "$found"
   fi
 
@@ -4160,14 +4194,7 @@ sv_main() {
     scan) sv_cmd_scan ;;
     revert) sv_cmd_revert ;;
     confirm) sv_cmd_confirm ;;
-    *)
-      if sv_is_module "$SV_CMD"; then sv_cmd_module "$SV_CMD"
-      else
-        sv_err "unknown command: $SV_CMD"
-        sv_err "Try: securevps.sh help"
-        exit 1
-      fi
-      ;;
+    *) sv_cmd_module "$SV_CMD" ;;
   esac
 }
 

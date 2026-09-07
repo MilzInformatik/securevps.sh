@@ -22,11 +22,37 @@ cat /root/.ssh/id_test.pub > /root/.ssh/authorized_keys
 
 MODULES="updates,user,ssh,bruteforce,pam,services,time,logging,banner,kmodules,sysctl"
 
-step "help and version"
-check "help exits 0"        "$SV help"
-check "version exits 0"     "$SV --version"
-check "bad flag is refused" "! $SV --nonsense-flag"
-check "bad module refused"  "! $SV --only nosuchmodule harden"
+step "argument handling"
+check "help exits 0"          "$SV help"
+check "version exits 0"       "$SV --version"
+check "bad flag is refused"   "! $SV --nonsense-flag"
+check "bad module refused"    "! $SV scan --only nosuchmodule"
+check "bad command refused"   "! $SV nosuchcommand"
+check "two commands refused"  "! $SV harden scan"
+# The command should be accepted before or after the flags; "--profile x
+# harden" was rejected outright until it was tested for. What matters here is
+# that the arguments parsed, not that the run succeeded: at this point in the
+# test no account has a key yet, so ssh refuses on purpose.
+parses() {
+  local name="$1"; shift
+  if "$@" 2>&1 | grep -qE 'unexpected argument|unknown (command|option|module)'; then
+    printf '  FAIL %s\n' "$name"; fail=$((fail + 1))
+  else
+    printf '  ok   %s\n' "$name"
+  fi
+}
+parses "flags before command"  $SV --profile minimal harden --dry-run --yes
+parses "flags after command"   $SV harden --profile minimal --dry-run --yes
+parses "module before flags"   $SV ssh --dry-run --yes
+parses "module after flags"    $SV --dry-run ssh --yes
+parses "revert takes a module" $SV revert ssh --dry-run
+
+step "revert with nothing to revert"
+# find(1) fails on a missing backup directory and pipefail used to carry that
+# out of the assignment, killing the run with no message at all.
+$SV revert >/tmp/revert0.log 2>&1 && rc=0 || rc=$?
+check "exits non-zero"        "[ '$rc' != 0 ]"
+check "says why"              "grep -q 'nothing to revert' /tmp/revert0.log"
 
 step "dry run changes nothing"
 before=$(md5sum /etc/ssh/sshd_config /etc/login.defs | md5sum)

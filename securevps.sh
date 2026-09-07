@@ -754,7 +754,7 @@ defopt docker.live-restore       bool true  "keep containers running across daem
 defopt docker.userland-proxy     bool false "use the userland proxy instead of iptables hairpin NAT"
 defopt docker.log-max-size       str  10m   "per-container log file size before rotation"
 defopt docker.log-max-file       int  3     "how many rotated log files to keep"
-defopt docker.only-rules         bool false "reapply the DOCKER-USER rules and nothing else, used by the systemd unit"
+defopt docker.only-rules         bool false "reapply the DOCKER-USER rules and nothing else"
 
 # --- bruteforce -----------------------------------------------------------
 defopt bruteforce.engine          str  fail2ban "fail2ban, crowdsec or none"
@@ -892,7 +892,7 @@ sv_ensure_line() {
 sv_managed_header() {
   cat <<EOF
 # Managed by securevps.sh $SV_VERSION. Edits here are overwritten on the next run.
-# Change the setting instead: $SV_DEFAULT_CONFIG or a --flag. See securevps.sh help.
+# Change the setting with a --flag instead. See securevps.sh help.
 EOF
 }
 
@@ -1068,6 +1068,16 @@ sv_user_key_count() {
   grep -cE '^[[:space:]]*(ssh-|ecdsa-|sk-)' "$home/.ssh/authorized_keys" 2>/dev/null || printf 0
 }
 
+# True when the account can get past sudo's password prompt: it has a usable
+# password, or a NOPASSWD rule. A fresh useradd has neither, and an admin who
+# can log in but never sudo is no admin once root is locked.
+sv_user_can_sudo() {
+  local acct="$1" hash
+  hash="$(getent shadow "$acct" 2>/dev/null | cut -d: -f2)"
+  [[ -n "$hash" && "$hash" != '!'* && "$hash" != '*'* ]] && return 0
+  sv_has_cmd sudo && sudo -l -U "$acct" 2>/dev/null | grep -q NOPASSWD
+}
+
 user_apply() {
   sv_header "user"
   local name; name="$(sv_get user.name)"
@@ -1105,6 +1115,16 @@ user_apply() {
       else
         sv_warn "no public key found for $name. Add one before locking root out:"
         sv_warn "  ssh-copy-id $name@$(hostname -I 2>/dev/null | awk '{print $1}')"
+      fi
+
+      # useradd leaves the password locked, and sudo asks for one. Ask now
+      # while there is a person at the keyboard.
+      if ! sv_bool user.sudo-nopasswd && ! sv_user_can_sudo "$name"; then
+        if [[ -t 0 ]] && ! sv_bool core.yes; then
+          sv_info "sudo will ask $name for a password. Set one now."
+          passwd "$name" </dev/tty || sv_warn "no password set for $name"
+        fi
+        sv_user_can_sudo "$name" || sv_note "$name has no password, so sudo will ask for one it cannot answer. Run: passwd $name (or use --user-sudo-nopasswd)."
       fi
     fi
 
@@ -1153,28 +1173,30 @@ EOF
         sv_ok "root password locked, key-based root login is unaffected"
       fi
     else
-      sv_warn "not locking root: no other account can get in and reach sudo yet"
-      sv_note "root's password is still active. Give $(sv_get user.name) an SSH key, then run: securevps.sh user"
+      sv_warn "not locking root: no other account can both log in and get past sudo yet"
+      sv_note "root's password is still active. Give $(sv_get user.name) an SSH key and a password (passwd $(sv_get user.name)), then run: securevps.sh user"
       sv_dry || return 1
     fi
   fi
   return 0
 }
 
-# True when some non-root account has an SSH key and sudo rights, so locking
-# root cannot strand us.
+# True when some non-root account has an SSH key, sudo rights, and a way past
+# sudo's password prompt, so locking root cannot strand us.
 user_root_lock_safe() {
   sv_bool core.force && return 0
   # A dry run has not created the administrator yet, so judge the plan, not
   # the current state.
-  if sv_dry && sv_bool user.create && [[ -n "$(user_collect_keys)" ]]; then return 0; fi
+  if sv_dry && sv_bool user.create && sv_bool user.sudo-nopasswd \
+     && [[ -n "$(user_collect_keys)" ]]; then return 0; fi
   local candidate home
   while IFS=: read -r candidate _ uid _ _ home _; do
     [[ "$uid" -ge 1000 && "$uid" -lt 65534 ]] || continue
     [[ -d "$home" ]] || continue
     [[ "$(sv_user_key_count "$home")" -gt 0 ]] || continue
     id -nG "$candidate" 2>/dev/null | tr ' ' '\n' | grep -qxE 'sudo|admin' || continue
-    sv_debug "root lock is safe, $candidate has a key and sudo"
+    sv_user_can_sudo "$candidate" || continue
+    sv_debug "root lock is safe, $candidate has a key, sudo, and a way past the prompt"
     return 0
   done <<< "$(getent passwd)"
   return 1
@@ -1189,6 +1211,11 @@ user_scan() {
       sv_check pass user admin-key "$name has an authorized SSH key"
     else
       sv_check fail user admin-key "$name has no authorized SSH key"
+    fi
+    if sv_user_can_sudo "$name"; then
+      sv_check pass user admin-sudo "$name can get past sudo's password prompt"
+    else
+      sv_check warn user admin-sudo "$name has no password and no NOPASSWD rule, sudo will refuse"
     fi
   else
     sv_check warn user admin "administrator $name does not exist"
@@ -1957,8 +1984,8 @@ EOF
 }
 
 docker_apply() {
-  # The systemd unit calls back into this script with --only-rules after every
-  # docker restart, because restarting docker flushes DOCKER-USER.
+  # Reapply the rules from an earlier run and stop. The systemd unit runs the
+  # standalone script directly; this is for doing the same by hand.
   if sv_bool docker.only-rules; then
     [[ -x "$SV_DOCKER_SCRIPT" ]] || return 1
     "$SV_DOCKER_SCRIPT"
@@ -2260,7 +2287,7 @@ EOF
 bruteforce_apply_crowdsec() {
   if ! sv_pkg_installed crowdsec; then
     sv_warn "CrowdSec is not in the distribution repositories."
-    sv_note "Install CrowdSec first (see docs/guide/bruteforce.md), then run: securevps.sh bruteforce --engine crowdsec"
+    sv_note "Install CrowdSec first (https://doc.crowdsec.net/docs/getting_started/install_crowdsec), then run: securevps.sh bruteforce --engine crowdsec"
     return 1
   fi
   sv_pkg_install crowdsec-firewall-bouncer-iptables || true
@@ -2674,10 +2701,6 @@ Options=bind,nosuid,nodev,noexec
 WantedBy=local-fs.target
 EOF
     [[ $SV_CHANGED -eq 1 ]] && changed=1
-  fi
-
-  if sv_bool mounts.home-nodev && grep -qE '[[:space:]]/home[[:space:]]' /etc/fstab 2>/dev/null; then
-    sv_note "/home has its own fstab entry. Add nosuid,nodev to it by hand; editing fstab automatically is not worth the risk."
   fi
 
   if [[ $changed -eq 1 ]] && ! sv_dry; then
@@ -3999,11 +4022,14 @@ sv_cmd_scan() {
   return 0
 }
 
-# Undo one run's manifest, newest entry first.
+# Undo one run's manifest, newest entry first. The tally goes in a global
+# rather than on stdout, because the restore messages go there too and a
+# "$(...)" capture would feed them into the arithmetic.
+SV_REVERT_COUNT=0
 sv_revert_run() {
   local dir="$1" filter="$2"
   [[ -f "$dir/manifest.tsv" ]] || { sv_warn "$(basename "$dir") has no manifest"; return 0; }
-  local count=0 action module path stored
+  local action module path stored
   while IFS=$'\t' read -r action module path stored; do
     [[ "$action" == \#* || -z "$action" ]] && continue
     # shellcheck disable=SC2086  # deliberate word splitting
@@ -4013,9 +4039,9 @@ sv_revert_run() {
       continue
     fi
     sv_revert_entry "$action" "$module" "$path" "$stored" "$dir"
-    count=$((count + 1))
+    SV_REVERT_COUNT=$((SV_REVERT_COUNT + 1))
   done <<< "$(tac "$dir/manifest.tsv")"
-  printf '%s' "$count"
+  return 0
 }
 
 sv_cmd_revert() {
@@ -4042,14 +4068,14 @@ sv_cmd_revert() {
   fi
 
   sv_say "Reverting ${#runs[@]} run(s)${filter:+, modules: $filter}"
-  local total=0 dir
+  local dir
   for dir in "${runs[@]}"; do
     sv_debug "run $(basename "$dir")"
-    total=$((total + $(sv_revert_run "$dir" "$filter")))
+    sv_revert_run "$dir" "$filter"
   done
 
   sv_say ""
-  sv_ok "$total file(s) restored"
+  sv_ok "$SV_REVERT_COUNT file(s) restored"
   sv_note "Services still have the new config loaded. Restart the ones you care about, or reboot."
   local n
   for n in "${SV_NOTES[@]}"; do printf '  %s %s\n' "${C_YELLOW}*${C_RESET}" "$n"; done
@@ -4112,7 +4138,11 @@ ${C_BOLD}COMMON OPTIONS${C_RESET}
       --profile P     minimal or standard
       --only a,b      run just these steps
       --skip a,b      run everything except these
+      --no-backup     do not copy files before editing them, revert cannot undo the run
+      --force         carry on past the lockout guards
       --run ID        revert only this run instead of all of them
+  -h, --help          this text
+  -V, --version       print the version
 
 ${C_BOLD}STEP OPTIONS${C_RESET}
   Every setting below is a flag. Inside a single-step run the prefix is

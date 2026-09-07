@@ -66,6 +66,14 @@ $SV scan --only "$MODULES" >/tmp/scan1.log 2>&1
 fails_before=$(grep -c 'FAIL' /tmp/scan1.log || true)
 printf '  %s failing checks before\n' "$fails_before"
 
+step "root lock guard"
+# useradd leaves the new admin with a locked password and sudo asks for one,
+# so key plus sudo group is not enough to make locking root safe.
+$SV user --yes >/tmp/user0.log 2>&1
+check "refuses to lock root while the admin cannot sudo" "grep -q 'not locking root' /tmp/user0.log"
+check "says how to fix it"  "grep -q 'passwd deploy' /tmp/user0.log"
+echo 'deploy:Smoke-Test-Pass-1' | chpasswd
+
 step "harden"
 $SV harden --yes --only "$MODULES" --no-updates-upgrade >/tmp/harden.log 2>&1
 rc=$?
@@ -81,6 +89,7 @@ check "modern kex only"           "! sshd -T | grep '^kexalgorithms' | grep -q s
 check "admin user exists"         "id deploy"
 check "admin in sudo group"       "id -nG deploy | tr ' ' '\n' | grep -qx sudo"
 check "admin has the key"         "grep -q ssh-ed25519 /home/deploy/.ssh/authorized_keys"
+check "admin can sudo"            "getent shadow deploy | cut -d: -f2 | grep -qvE '^[!*]'"
 check "admin key mode 0600"       "[ \"\$(stat -c %a /home/deploy/.ssh/authorized_keys)\" = 600 ]"
 check "root password locked"      "passwd -S root | awk '{print \$2}' | grep -qE '^(L|LK)\$'"
 check "umask 027 in login.defs"   "grep -qE '^UMASK\s+027' /etc/login.defs"
@@ -105,7 +114,11 @@ printf '  second run reported %s change(s)\n' "$changes"
 check "second run is a no-op" "[ '${changes:-99}' -le 2 ]"
 
 step "revert"
-$SV revert >/tmp/revert.log 2>&1
+# Two runs touched login.defs, so this also proves the older run is replayed
+# after the newer one rather than the command dying between them.
+$SV revert >/tmp/revert.log 2>&1 && rc=0 || rc=$?
+check "revert exits 0"            "[ '$rc' = 0 ]"
+check "revert reports a count"    "grep -qE '[0-9]+ file\(s\) restored' /tmp/revert.log"
 check "sshd config still valid after revert" "sshd -t"
 check "our drop-in is gone"       "[ ! -f /etc/ssh/sshd_config.d/99-securevps.conf ]"
 check "login.defs umask restored" "! grep -qE '^UMASK\s+027' /etc/login.defs"

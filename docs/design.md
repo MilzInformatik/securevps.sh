@@ -20,7 +20,7 @@ Any module runs alone:
 ```
 securevps.sh ssh --port 2222 --allow-users deploy,alice
 securevps.sh firewall --allow 80,443 --allow-from 10.0.0.0/8:5432
-securevps.sh docker --disable-icc
+securevps.sh docker --no-icc
 ```
 
 ## Global flags
@@ -32,10 +32,13 @@ securevps.sh docker --disable-icc
 | `--profile minimal\|standard` | which steps `harden` runs |
 | `--only <a,b>` / `--skip <a,b>` | module selection for `harden` |
 | `--no-backup` | skip config backups, off by default |
+| `--force` | carry on past the lockout guards |
+| `--run ID` | `revert` one run instead of all of them |
 | `--json` | machine-readable output, mainly for `scan` |
 | `--quiet` / `--verbose` | log level |
 
-Every module also takes `--dry-run` and `--revert` on its own.
+Every module runs on its own with the same global flags, and `revert <module>`
+undoes just that module's files.
 
 ## Profiles
 
@@ -70,9 +73,11 @@ Validated. Anything with a syntax checker gets checked before the service reload
 `nft -c`, `fail2ban-client -t`, `visudo -c`, `apparmor_parser -Q`. A failed check restores the
 backup and aborts the module rather than the whole run.
 
-Lockout-safe. The SSH module opens a temporary sshd on a second port, applies the change,
-waits for the operator to confirm a new session works, and rolls back on a timeout if nobody
-confirms. `--yes` skips the wait but keeps the rollback timer.
+Lockout-safe. The SSH module refuses a config no account could log in through, validates
+with `sshd -t` before reloading, and arms a systemd timer that restores the previous config
+unless `securevps.sh confirm` runs from a second session. `--yes` skips the prompt but keeps
+the timer. The user module refuses to lock root until some non-root account has a key, sudo
+membership, and either a password or a NOPASSWD rule.
 
 Loud about what it cannot know. If Docker publishes a port to `0.0.0.0`, if a non-root user is
 in the `docker` group, if the box is a router, the script reports and does not silently
@@ -110,17 +115,17 @@ means writing those two functions, adding its options with `defopt`, and adding
 its name to `MODULE_DESC`, `SV_MODULE_ORDER` and whichever profile should run
 it.
 
-Install is a download and a checksum:
+Install is a download:
 
 ```
 curl -fsSLO https://.../securevps.sh
-sha256sum -c securevps.sh.sha256
+less securevps.sh
 sudo bash securevps.sh harden
 ```
 
-Piping straight into bash is documented but not the headline instruction.
-Downloading, checking the hash, and reading the thing before it edits sshd is a
-habit worth keeping in a security tool.
+Piping straight into bash is deliberately not documented. Downloading and
+reading the thing before it edits sshd is a habit worth keeping in a security
+tool.
 
 ## Testing
 
@@ -130,8 +135,9 @@ habit worth keeping in a security tool.
 - `tests/integration/run.sh <suite>` builds a throwaway root filesystem with
   debootstrap, runs the modules in it, and checks: a dry run writes nothing,
   the applied state is what was asked for, `scan` agrees, a second run reports
-  zero changes, `revert` puts everything back, all three flag forms work, and
-  the lockout guard refuses a configuration with no way in.
+  zero changes, `revert` puts everything back, all three flag forms work, the
+  ssh guard refuses a configuration with no way in, and the user guard refuses
+  to lock root while the admin cannot sudo.
 
 A chroot has no systemd and no host kernel, so the modules that need those
 report themselves as skipped rather than being exercised. `firewall`, `sysctl`,

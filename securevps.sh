@@ -36,6 +36,10 @@ readonly SV_MODULE_ORDER=(
   mfa vpn alerts backup
 )
 
+# core is the default: the six steps that matter on any internet-facing VPS
+# and whose effects are easy to explain and easy to undo. standard adds the
+# rest, minimal is core without the two steps that touch accounts and Docker.
+readonly SV_PROFILE_CORE=(updates user firewall ssh docker bruteforce)
 readonly SV_PROFILE_MINIMAL=(updates ssh firewall bruteforce sysctl time banner)
 readonly SV_PROFILE_STANDARD=(
   updates user firewall ssh docker bruteforce sysctl kmodules
@@ -689,7 +693,7 @@ defopt core.yes      bool false    "answer every prompt with yes"
 defopt core.verbose  bool false    "log what each check is doing"
 defopt core.quiet    bool false    "only errors"
 defopt core.json     bool false    "machine-readable output, mainly for scan"
-defopt core.profile  str  standard "minimal or standard"
+defopt core.profile  str  core     "core, minimal or standard"
 defopt core.backup   bool true     "back up every file before editing it"
 defopt core.only     str  ""       "comma-separated modules to run"
 defopt core.skip     str  ""       "comma-separated modules to leave out"
@@ -778,8 +782,6 @@ defopt sysctl.userns        bool true  "keep unprivileged user namespaces, conta
 # --- kmodules -------------------------------------------------------------
 defopt kmodules.filesystems  bool true  "blacklist cramfs, freevxfs, jffs2, hfs, hfsplus, udf"
 defopt kmodules.protocols    bool true  "blacklist dccp, sctp, rds, tipc"
-defopt kmodules.firewire     bool true  "blacklist firewire DMA modules"
-defopt kmodules.usb-storage  bool false "blacklist usb-storage"
 defopt kmodules.extra        str  ""    "extra modules to blacklist, comma separated"
 
 # --- mounts ---------------------------------------------------------------
@@ -2545,8 +2547,6 @@ kmodules_list() {
   local out=""
   sv_bool kmodules.filesystems && out="$out cramfs freevxfs jffs2 hfs hfsplus udf"
   sv_bool kmodules.protocols && out="$out dccp sctp rds tipc"
-  sv_bool kmodules.firewire && out="$out firewire-core firewire-ohci firewire-sbp2"
-  sv_bool kmodules.usb-storage && out="$out usb-storage"
   local extra; extra="$(sv_get kmodules.extra)"
   [[ -n "$extra" ]] && out="$out ${extra//,/ }"
   printf '%s' "${out# }"
@@ -3882,9 +3882,10 @@ sv_parse_args() {
 
 sv_profile_modules() {
   case "$(sv_get core.profile)" in
+    core) printf '%s\n' "${SV_PROFILE_CORE[@]}" ;;
     minimal) printf '%s\n' "${SV_PROFILE_MINIMAL[@]}" ;;
     standard) printf '%s\n' "${SV_PROFILE_STANDARD[@]}" ;;
-    *) sv_die "unknown profile: $(sv_get core.profile). Pick minimal or standard." ;;
+    *) sv_die "unknown profile: $(sv_get core.profile). Pick core, minimal or standard." ;;
   esac
 }
 
@@ -4121,13 +4122,15 @@ EOF
   cat <<EOF
 
 ${C_BOLD}PROFILES${C_RESET}
+  core       ${SV_PROFILE_CORE[*]}
+             the default. What every internet-facing VPS needs.
   minimal    ${SV_PROFILE_MINIMAL[*]}
              nothing here can break a running application.
-  standard   the default, everything above plus accounts, Docker, PAM,
-             logging, mount options and the rest.
+  standard   ${SV_PROFILE_STANDARD[*]}
+             core plus kernel, PAM, service, logging and mount hardening.
 
-  Anything outside the profile is one command away, so there is no third
-  profile: securevps.sh integrity --enable, securevps.sh mfa --enable.
+  Any step outside the profile is one command away:
+  securevps.sh pam, securevps.sh mfa --enable, securevps.sh harden --profile standard.
 
 ${C_BOLD}COMMON OPTIONS${C_RESET}
   -n, --dry-run       show a diff of every change, write nothing
@@ -4135,7 +4138,7 @@ ${C_BOLD}COMMON OPTIONS${C_RESET}
   -v, --verbose       explain each decision
   -q, --quiet         errors only
       --json          machine-readable output, mainly for scan
-      --profile P     minimal or standard
+      --profile P     core (default), minimal or standard
       --only a,b      run just these steps
       --skip a,b      run everything except these
       --no-backup     do not copy files before editing them, revert cannot undo the run
@@ -4170,7 +4173,8 @@ EOF
 
 ${C_BOLD}EXAMPLES${C_RESET}
   securevps.sh --dry-run                 see what a default run would change
-  securevps.sh harden                    apply the standard profile
+  securevps.sh harden                    apply the core profile
+  securevps.sh harden --profile standard every step that is on by default
   securevps.sh harden --ssh-port 2222 --firewall-allow 80,443
   securevps.sh ssh --tcp-forwarding      re-enable tunnels for an admin UI
   securevps.sh docker --allow-published 80,443

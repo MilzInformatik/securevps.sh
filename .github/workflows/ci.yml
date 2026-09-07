@@ -14,7 +14,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          shellcheck securevps.sh tests/integration/*.sh
+          shellcheck securevps.sh tests/*.sh tests/integration/*.sh
       - name: the script parses and answers for itself
         run: |
           bash -n securevps.sh
@@ -29,6 +29,8 @@ jobs:
           ! ./securevps.sh nosuchcommand 2>/dev/null
           ! ./securevps.sh harden scan 2>/dev/null
           ./securevps.sh scan --only nosuchmodule 2>&1 | grep -q 'unknown module'
+      - name: every command in the README parses
+        run: tests/readme-commands.sh
       - name: the command is accepted before or after the flags
         run: |
           ./securevps.sh --profile minimal scan --json > /dev/null || true

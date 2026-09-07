@@ -20,7 +20,7 @@ mkdir -p /root/.ssh
 ssh-keygen -q -t ed25519 -f /root/.ssh/id_test -N "" -C test
 cat /root/.ssh/id_test.pub > /root/.ssh/authorized_keys
 
-MODULES="updates,user,ssh,bruteforce,pam,services,time,logging,banner,kmodules,sysctl"
+MODULES="updates,user,ssh,bruteforce,pam,services,time,logging,banner,kmodules,sysctl,mounts"
 
 step "argument handling"
 check "help exits 0"          "$SV help"

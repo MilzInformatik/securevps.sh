@@ -13,8 +13,10 @@ set -euo pipefail
 
 SUITE="${1:-noble}"
 case "$SUITE" in
-  noble|jammy) MIRROR="http://archive.ubuntu.com/ubuntu/" ;;
-  bookworm|trixie) MIRROR="http://deb.debian.org/debian/" ;;
+  # fail2ban is in universe on Ubuntu and in main on Debian, so the component
+  # list is not the same on both and minbase defaults to main alone.
+  noble|jammy) MIRROR="http://archive.ubuntu.com/ubuntu/"; COMPONENTS="main,universe" ;;
+  bookworm|trixie) MIRROR="http://deb.debian.org/debian/"; COMPONENTS="main" ;;
   *) echo "unknown suite: $SUITE" >&2; exit 2 ;;
 esac
 
@@ -54,13 +56,20 @@ command -v mountpoint >/dev/null || { echo "mountpoint(1) is required" >&2; exit
 if [[ ! -f "$BASE" ]]; then
   echo "building the $SUITE base image, this happens once"
   mkdir -p "$CACHE/build-$SUITE"
-  debootstrap --variant=minbase \
+  debootstrap --variant=minbase --components="$COMPONENTS" \
     --include=systemd,sudo,ca-certificates,openssh-server \
     "$SUITE" "$CACHE/build-$SUITE" "$MIRROR" >/dev/null
+  chroot "$CACHE/build-$SUITE" apt-get update -qq >/dev/null 2>&1 || true
+  # Fail loudly here rather than letting the suite report a mystery failure
+  # three minutes later.
+  if ! chroot "$CACHE/build-$SUITE" apt-cache show fail2ban >/dev/null 2>&1; then
+    echo "fail2ban is not available in $SUITE with components $COMPONENTS" >&2
+    rm -rf "$CACHE/build-$SUITE"
+    exit 1
+  fi
   # A chroot has no host kernel, which is exactly what the container guard
   # in securevps.sh keys off.
   touch "$CACHE/build-$SUITE/.dockerenv"
-  chroot "$CACHE/build-$SUITE" apt-get update -qq >/dev/null 2>&1 || true
   tar -C "$CACHE/build-$SUITE" -czf "$BASE" .
   # Nothing is mounted under the build tree, but check before deleting anyway.
   if mountpoint -q "$CACHE/build-$SUITE/dev" 2>/dev/null; then

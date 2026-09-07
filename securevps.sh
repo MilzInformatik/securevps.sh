@@ -107,7 +107,11 @@ sv_ok()   { sv_quiet || sv_is_json || printf '%s\n' "${C_GREEN}ok${C_RESET} $*";
 sv_skip() { sv_quiet || sv_is_json || printf '%s\n' "${C_DIM}--${C_RESET} ${C_DIM}$*${C_RESET}"; }
 sv_warn() { sv_is_json || printf '%s\n' "${C_YELLOW}!!${C_RESET} $*" >&2; }
 sv_err()  { printf '%s\n' "${C_RED}xx${C_RESET} $*" >&2; }
-sv_debug() { sv_is_verbose && ! sv_is_json && printf '%s\n' "${C_DIM}   $*${C_RESET}" >&2 || true; }
+sv_debug() {
+  sv_is_verbose || return 0
+  sv_is_json && return 0
+  printf '%s\n' "${C_DIM}   $*${C_RESET}" >&2
+}
 
 sv_die() { sv_err "$*"; exit 1; }
 
@@ -476,8 +480,19 @@ sv_unit_exists() {
     systemctl list-unit-files "$1" 2>/dev/null | grep -q "^$1"
 }
 
-sv_unit_active() { systemctl is-active --quiet "$1" 2>/dev/null; }
-sv_unit_enabled() { systemctl is-enabled --quiet "$1" 2>/dev/null; }
+# systemctl reads /proc/1 to decide whether systemd is running. Inside a
+# chroot on a systemd host that check passes while the unit database does not
+# belong to us, and is-active then answers for units that do not exist here.
+# Requiring the unit file keeps the answer honest.
+sv_unit_active() {
+  [[ $SV_HAS_SYSTEMD -eq 1 ]] || return 1
+  sv_unit_exists "$1" || return 1
+  systemctl is-active --quiet "$1" 2>/dev/null
+}
+sv_unit_enabled() {
+  [[ $SV_HAS_SYSTEMD -eq 1 ]] || return 1
+  systemctl is-enabled --quiet "$1" 2>/dev/null
+}
 
 sv_svc_enable() {
   local unit="$1"
@@ -795,6 +810,7 @@ sv_ensure_line() {
   local module="$1" path="$2" line="$3" regex="${4:-}"
   SV_CHANGED=0
   [[ -f "$path" ]] || { sv_debug "$path missing, not adding line"; return 0; }
+  # shellcheck disable=SC2016  # a sed program, not a shell expansion
   [[ -z "$regex" ]] && regex="$(printf '%s' "$line" | sed 's/[][\.*^$(){}?+|/]/\\&/g')"
   grep -qE "$regex" "$path" && return 0
   if sv_dry; then sv_would "append to $path: $line"; SV_CHANGED=1; return 0; fi
@@ -851,6 +867,7 @@ Unattended-Upgrade::Automatic-Reboot-WithUsers \"false\";
 Unattended-Upgrade::Automatic-Reboot-Time \"$reboot_time\";"
     fi
 
+    # shellcheck disable=SC2016  # unattended-upgrades expands these itself
     if [[ "$SV_OS_ID" == ubuntu ]]; then
       origins='        "${distro_id}:${distro_codename}-security";
         "${distro_id}ESMApps:${distro_codename}-apps-security";
@@ -965,7 +982,9 @@ user_collect_keys() {
   fi
   local f
   for f in /root/.ssh/authorized_keys /root/.ssh/authorized_keys2; do
-    [[ -s "$f" ]] && grep -E '^(ssh|ecdsa|sk-)' "$f" || true
+    [[ -s "$f" ]] || continue
+    # shellcheck disable=SC2016  # a grep pattern, not a shell expansion
+    grep -E '^(ssh|ecdsa|sk-)' "$f" || true
   done
 }
 
@@ -1450,7 +1469,7 @@ ssh_apply() {
   # normally creates at boot. On a fresh or minimal install it may not exist
   # yet, and its absence has nothing to do with the configuration.
   if [[ ! -d /run/sshd ]] && ! sv_dry; then
-    mkdir -p /run/sshd 2>/dev/null && chmod 0755 /run/sshd 2>/dev/null || true
+    if mkdir -p /run/sshd 2>/dev/null; then chmod 0755 /run/sshd 2>/dev/null || true; fi
   fi
 
   if ! ssh_login_path_exists; then
@@ -2067,15 +2086,21 @@ docker_scan() {
 
   if [[ -f /etc/docker/daemon.json ]]; then
     local j; j="$(cat /etc/docker/daemon.json)"
-    grep -q '"no-new-privileges": *true' <<<"$j" \
-      && sv_check pass docker no-new-privileges "no-new-privileges is on" \
-      || sv_check fail docker no-new-privileges "no-new-privileges is not set"
-    grep -q '"live-restore": *true' <<<"$j" \
-      && sv_check pass docker live-restore "live-restore is on" \
-      || sv_check warn docker live-restore "live-restore is off, containers stop when the daemon restarts"
-    grep -q '"max-size"' <<<"$j" \
-      && sv_check pass docker log-rotation "container logs rotate" \
-      || sv_check fail docker log-rotation "container logs are not rotated and will fill the disk"
+    if grep -q '"no-new-privileges": *true' <<<"$j"; then
+      sv_check pass docker no-new-privileges "no-new-privileges is on"
+    else
+      sv_check fail docker no-new-privileges "no-new-privileges is not set"
+    fi
+    if grep -q '"live-restore": *true' <<<"$j"; then
+      sv_check pass docker live-restore "live-restore is on"
+    else
+      sv_check warn docker live-restore "live-restore is off, containers stop when the daemon restarts"
+    fi
+    if grep -q '"max-size"' <<<"$j"; then
+      sv_check pass docker log-rotation "container logs rotate"
+    else
+      sv_check fail docker log-rotation "container logs are not rotated and will fill the disk"
+    fi
   else
     sv_check fail docker daemon-config "no /etc/docker/daemon.json"
   fi
@@ -2471,15 +2496,19 @@ kmodules_apply() {
 
   sv_write_gen kmodules /etc/modprobe.d/99-securevps.conf 0644 kmodules_render
 
-  [[ $SV_CHANGED -eq 1 ]] && sv_ok "blacklisted: $mods" || sv_skip "blacklist already in place"
+  if [[ $SV_CHANGED -eq 1 ]]; then sv_ok "blacklisted: $mods"
+  else sv_skip "blacklist already in place"; fi
 
   # Unload anything already loaded that we just blacklisted, if it is idle.
   if ! sv_dry; then
     local m
     for m in $mods; do
       lsmod 2>/dev/null | awk '{print $1}' | grep -qx "${m//-/_}" || continue
-      modprobe -r "$m" >/dev/null 2>&1 && sv_ok "unloaded $m" \
-        || sv_debug "$m is loaded and in use, it will stay until reboot"
+      if modprobe -r "$m" >/dev/null 2>&1; then
+        sv_ok "unloaded $m"
+      else
+        sv_debug "$m is loaded and in use, it will stay until reboot"
+      fi
     done
   fi
   return 0
@@ -2862,8 +2891,11 @@ time_apply() {
     if [[ "$(timedatectl show -p Timezone --value 2>/dev/null)" != "$tz" ]]; then
       if sv_dry; then sv_would "timedatectl set-timezone $tz"
       else
-        timedatectl set-timezone "$tz" 2>/dev/null && sv_ok "timezone set to $tz" \
-          || sv_warn "could not set the timezone to $tz"
+        if timedatectl set-timezone "$tz" 2>/dev/null; then
+          sv_ok "timezone set to $tz"
+        else
+          sv_warn "could not set the timezone to $tz"
+        fi
       fi
     else
       sv_skip "timezone already $tz"
@@ -3526,8 +3558,10 @@ service: \$PAM_SERVICE
 host:    \$host
 when:    \$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
-$( [[ -n "$email" ]] && printf 'printf "%%s\\n" "$body" | mail -s "$subject" %s 2>/dev/null || true' "$email" )
-$( [[ -n "$webhook" ]] && printf 'command -v curl >/dev/null && curl -fsS -m 10 -X POST -H "Content-Type: application/json" -d "{\\"text\\":\\"\$subject\\"}" %s >/dev/null 2>&1 || true' "$webhook" )
+$( # shellcheck disable=SC2016  # \$body and \$subject belong to the generated script
+   [[ -n "$email" ]] && printf 'printf "%%s\\n" "$body" | mail -s "$subject" %s 2>/dev/null || true' "$email" )
+$( # shellcheck disable=SC2016  # \$subject belongs to the generated script
+   [[ -n "$webhook" ]] && printf 'command -v curl >/dev/null && curl -fsS -m 10 -X POST -H "Content-Type: application/json" -d "{\\"text\\":\\"\$subject\\"}" %s >/dev/null 2>&1 || true' "$webhook" )
 exit 0
 EOF
 
